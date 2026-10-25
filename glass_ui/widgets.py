@@ -20,6 +20,25 @@ from .theme import (C_ACCENT, C_BG, C_ORANGE, C_PANEL, C_RED, FONT_MONO,
                     FONT_UI, LOG_COLORS)
 
 
+def _rgb(color, fallback=(255, 255, 255)):
+    """`#rrggbb` / `#rgb` → (r, g, b)。需要自己插值渐变时用。"""
+    try:
+        s = str(color).strip().lstrip("#")
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        return fallback
+
+
+def _mix(a, b, t):
+    """两个 RGB 之间线性插值，t=0 取 a、t=1 取 b。"""
+    t = max(0.0, min(1.0, float(t)))
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
+
+
 class GlassButton:
     """胶囊按钮：三态贴图（常态 / 悬停 / 按下）+ Canvas 文字。
 
@@ -63,6 +82,20 @@ class GlassButton:
             if img is not None:
                 self._imgs[st] = img
                 self._tkimg[st] = ImageTk.PhotoImage(img)
+
+    def rebuild_images(self):
+        """按当前引擎参数重新生成三态贴图。
+
+        窗口的玻璃强度（`GlassEngine.VEIL`）可以在运行期被改掉，
+        而底面 alpha 是烘进贴图里的 —— 改完必须让按钮重画一次，
+        否则按钮和背景的层次会对不上。
+        """
+        if not self.app.engine.ok:
+            return
+        self._imgs = {}
+        self._tkimg = {}
+        self._build_images()
+        self.redraw()
 
     def _set_state(self, st):
         if not self.enabled:
@@ -119,12 +152,27 @@ class GlassButton:
 class IconButton:
     """标题栏用的圆形图标按钮（最小化 / 关闭 / 帮助）。"""
 
-    def __init__(self, app, glyph, cmd, x, y, size=30, danger=False):
+    def __init__(self, app, glyph, cmd, x, y, size=30, danger=False,
+                 glyph_font=None):
+        """构造圆形图标按钮。
+
+        Args:
+            app: 宿主窗口（需要 `cv`）。
+            glyph: 图标字符，如 "✕" "—" "?" "⚙"。
+            cmd: 点击回调。
+            x, y: 相对 `app.cv` 的左上角坐标。
+            size: 按钮直径。标题栏三个键是靠 `w - 42/76/110` 排开的，
+                改这个值要一并调整间距。
+            danger: True 时悬停底色为红色（关闭键用）。
+            glyph_font: 图标字体。某些符号（如 ⚙ U+2699）不在雅黑里，
+                需要指定系统符号字体，否则会渲染成豆腐块。
+        """
         self.app = app
         self.glyph = glyph
         self.cmd = cmd
         self.size = size
         self.danger = danger
+        self.glyph_font = glyph_font
         self.x, self.y = x, y
         self._bg = None
         self.cv = tk.Canvas(app.cv, width=size, height=size, bd=0,
@@ -159,9 +207,10 @@ class IconButton:
         fg = "#0b0d13" if self.hover else "#aab2c4"
         if self.hover and self.danger:
             fg = "#ffffff"
+        font = self.glyph_font or (FONT_UI, 10 if self.glyph != "✕" else 9,
+                                   "bold")
         cv.create_text(s / 2.0, s / 2.0 + (1 if self.glyph == "—" else 0),
-                       text=self.glyph, fill=fg,
-                       font=(FONT_UI, 10 if self.glyph != "✕" else 9, "bold"))
+                       text=self.glyph, fill=fg, font=font)
 
 
 class GlassToggle:
@@ -287,13 +336,281 @@ class GlassToggle:
                        fill="#b9c1d2" if on else "#8e96a8", font=(FONT_UI, 9))
 
 
+class GlassSlider:
+    """横向玻璃滑块：圆角轨道 + 主题色渐变填充 + 白色圆形滑块头。
+
+    为什么整条用 PIL 渲染成 PhotoImage：
+
+    * Canvas 的 `create_line` 画不出带圆角的轨道，端点是硬方角；
+    * 纯色填充会盖住玻璃底（Canvas 没有 alpha）；
+    * 滑块头需要投影和球面明暗，`create_oval` 做不出来。
+
+    交互按"轨道任意位置点击立即跳值 + 按住拖动实时跟随 + 松手回调"实现：
+
+    * `on_drag(value)` —— 拖动过程中回调，节流到 `drag_interval`（默认 60ms），
+      给需要"实时预览"的调用方用；
+    * `on_change(value)` —— 松手时才回调，给"比较贵、不能每帧做"的动作用
+      （比如重建玻璃背景）。
+    """
+
+    def __init__(self, app, x, y, w, value=0.5, on_change=None, h=8,
+                 parent=None, on_drag=None, knob=18, drag_interval=0.06):
+        """构造滑块。
+
+        Args:
+            app: 宿主窗口，需要有 `cv` 与 `engine`（GlassWindow 系列都满足）。
+            x, y: 滑块画布左上角坐标（相对 `parent`）。
+            w: 轨道长度（像素，不含两侧给滑块头留的余量）。
+            value: 初始值，0.0~1.0。
+            on_change: 松手回调，签名 `fn(value: float)`。
+            h: 轨道高度（像素）。
+            parent: 放置滑块画布的父容器，默认 `app.cv`。
+            on_drag: 拖动中的节流回调，签名 `fn(value: float)`。
+            knob: 滑块头直径（像素）。
+            drag_interval: `on_drag` 的最小触发间隔（秒）。
+        """
+        self.app = app
+        self.track_w = max(40, int(w))
+        self.track_h = max(4, int(h))
+        self.knob_d = max(12, int(knob))
+        self.value = max(0.0, min(1.0, float(value)))
+        self.on_change = on_change
+        self.on_drag = on_drag
+        self.drag_interval = max(0.0, float(drag_interval))
+        self.enabled = True
+
+        # 滑块头半径的两侧余量：值为 0 / 1 时圆头都不能越出画布
+        self.pad = self.knob_d / 2.0 + 1.0
+        self.cw = int(round(self.track_w + self.pad * 2))
+        self.ch = int(max(self.knob_d, self.track_h) + 6)
+
+        self._bg = None
+        self._img = None
+        self._tkimg = None
+        self._key = None
+        self._drag = False
+        self._last_drag_ts = 0.0
+
+        master = parent or app.cv
+        self.cv = tk.Canvas(master, width=self.cw, height=self.ch, bd=0,
+                            highlightthickness=0, bg=C_BG, cursor="hand2")
+        self.cv.place(x=x, y=y, width=self.cw, height=self.ch)
+        # 拖动时指针常常跑到轨道外面，Tk 的隐式抓取会继续把 Motion 发给本画布
+        self.cv.bind("<Button-1>", self._on_press)
+        self.cv.bind("<B1-Motion>", self._on_move)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self.redraw()
+
+    # ------------------------------------------------------------ 对外接口
+    def set_background(self, pil_img):
+        """铺所在区域的背景切片，否则圆角外会露出深色方块（同 GlassButton）。"""
+        self._bg = None if pil_img is None else ImageTk.PhotoImage(pil_img)
+        self.redraw()
+
+    def get_value(self):
+        return self.value
+
+    def set_value(self, value, notify=False):
+        """外部改值（不触发拖动）。`notify=True` 时按松手处理，回调 on_change。"""
+        self.value = max(0.0, min(1.0, float(value)))
+        self.redraw()
+        if notify and self.on_change is not None:
+            try:
+                self.on_change(self.value)
+            except Exception:
+                pass
+        return self.value
+
+    def configure(self, **kw):
+        if "value" in kw:
+            self.set_value(kw["value"])
+        if "state" in kw:
+            self.enabled = (kw["state"] != "disabled")
+            self.cv.configure(cursor="hand2" if self.enabled else "arrow")
+
+    config = configure
+
+    # -------------------------------------------------------------- 交互
+    def _value_at(self, px):
+        """画布横坐标 → 0~1 的值。轨道两端之间线性映射，越界夹紧。"""
+        span = float(self.track_w)
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (float(px) - self.pad) / span))
+
+    def _on_press(self, event):
+        if not self.enabled:
+            return
+        self._drag = True
+        self._last_drag_ts = 0.0
+        self._apply(self._value_at(event.x), drag=True)
+
+    def _on_move(self, event):
+        if not self._drag or not self.enabled:
+            return
+        self._apply(self._value_at(event.x), drag=True)
+
+    def _on_release(self, event):
+        if not self._drag:
+            return
+        self._drag = False
+        self._apply(self._value_at(event.x), drag=False)
+        if self.on_change is not None:
+            try:
+                self.on_change(self.value)
+            except Exception:
+                pass
+
+    def _apply(self, value, drag):
+        self.value = max(0.0, min(1.0, float(value)))
+        self.redraw()
+        if drag and self.on_drag is not None:
+            now = time.time()
+            if now - self._last_drag_ts >= self.drag_interval:
+                self._last_drag_ts = now
+                try:
+                    self.on_drag(self.value)
+                except Exception:
+                    pass
+
+    # -------------------------------------------------------------- 绘制
+    @staticmethod
+    def _mask_round(layer, r):
+        """按圆角轮廓裁掉渐变溢出到端点的像素。"""
+        w, h = layer.size
+        m = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(m).rounded_rectangle([0, 0, w - 1, h - 1],
+                                            radius=r, fill=255)
+        layer.putalpha(ImageChops.multiply(layer.split()[3], m))
+        return layer
+
+    def _render(self):
+        """渲染整条滑块（轨道 + 填充 + 滑块头）。失败返回 None。"""
+        if not self.app.engine.ok:
+            return None
+        try:
+            return self._render_unsafe()
+        except Exception:
+            return None
+
+    def _render_unsafe(self):
+        w, h = self.cw, self.ch
+        tw, th = self.track_w, self.track_h
+        x1 = int(round(self.pad))
+        ty = int((h - th) // 2)
+        x2 = x1 + tw
+        r = th / 2.0
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+        # --- 1. 轨道底：半透明深色 + 1px 亮边（独立图层再合成）---
+        base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(base).rounded_rectangle(
+            [x1, ty, x2 - 1, ty + th - 1], radius=r,
+            fill=(0, 0, 0, 86), outline=(255, 255, 255, 40), width=1)
+        img = Image.alpha_composite(img, base)
+
+        # --- 2. 已填充段：主题色竖向渐变（顶部加高光，不用 arc）---
+        fw = int(round(tw * self.value))
+        if fw > 0:
+            fw = min(tw, max(int(th), fw))      # 极短时保持胶囊形，不留尖角
+            accent = _rgb(C_ACCENT)
+            top = _mix(accent, (255, 255, 255), 0.34)
+            bot = _mix(accent, (0, 0, 0), 0.22)
+            grad = Image.new("RGBA", (fw, th), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(grad)
+            for i in range(th):
+                t = i / float(max(1, th - 1))
+                add = int(38 * (1.0 - t) * (1.0 - t))     # 顶部柔光
+                c = _mix(top, bot, t)
+                gd.line([(0, i), (fw, i)],
+                        fill=(min(255, c[0] + add), min(255, c[1] + add),
+                              min(255, c[2] + add), 255))
+            grad = self._mask_round(grad, min(r, fw / 2.0))
+            img.alpha_composite(grad, (x1, ty))
+
+        # --- 3. 滑块头：投影 → 白色主体 → 球面明暗 → 轮廓 ---
+        cx = self.pad + tw * self.value
+        kd = float(self.knob_d)
+        kx = cx - kd / 2.0
+        ky = (h - kd) / 2.0
+
+        sh = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).ellipse([kx + 0.5, ky + 1.5,
+                                    kx + kd + 0.5, ky + kd + 1.5],
+                                   fill=(0, 0, 0, 110))
+        img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(2.0)))
+
+        knob = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(knob).ellipse([kx, ky, kx + kd, ky + kd],
+                                     fill=(255, 255, 255, 255))
+        img = Image.alpha_composite(img, knob)
+
+        sph = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(sph).ellipse([kx, ky + kd * 0.50, kx + kd, ky + kd],
+                                    fill=(70, 84, 108, 70))
+        sph = sph.filter(ImageFilter.GaussianBlur(2.2))
+        m = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(m).ellipse([kx, ky, kx + kd, ky + kd], fill=255)
+        sph.putalpha(ImageChops.multiply(sph.split()[3], m))
+        img = Image.alpha_composite(img, sph)
+
+        edge = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(edge).ellipse([kx, ky, kx + kd, ky + kd],
+                                     outline=(255, 255, 255, 165), width=1)
+        img = Image.alpha_composite(img, edge)
+        return img
+
+    def redraw(self):
+        cv = self.cv
+        cv.delete("all")
+        if self._bg is not None:
+            cv.create_image(0, 0, image=self._bg, anchor="nw")
+
+        # 拖动时每帧都会走这里：按 1/400 量化缓存，避免重复做高斯模糊
+        key = (int(round(self.value * 400)), self.cw, self.ch)
+        if self._tkimg is None or key != self._key:
+            img = self._render()
+            self._key = key
+            self._img = img
+            self._tkimg = None if img is None else ImageTk.PhotoImage(img)
+
+        if self._tkimg is not None:
+            cv.create_image(0, 0, image=self._tkimg, anchor="nw")
+        else:
+            self._redraw_fallback(cv)
+
+    def _redraw_fallback(self, cv):
+        """没有 Pillow 时的兜底：纯色胶囊 + 实心圆点。"""
+        x1 = self.pad
+        x2 = x1 + self.track_w
+        ty = (self.ch - self.track_h) / 2.0
+        rrect(cv, x1, ty, x2, ty + self.track_h, self.track_h / 2.0,
+              fill="#3a4054", outline="")
+        fx = x1 + self.track_w * self.value
+        if self.value > 0:
+            rrect(cv, x1, ty, max(x1 + self.track_h, fx), ty + self.track_h,
+                  self.track_h / 2.0, fill=C_ACCENT, outline="")
+        kd = self.knob_d
+        cx = x1 + self.track_w * self.value
+        cv.create_oval(cx - kd / 2.0, (self.ch - kd) / 2.0,
+                       cx + kd / 2.0, (self.ch + kd) / 2.0,
+                       fill="#ffffff", outline="")
+
+
 class GlassTable:
     """可滚动的自绘表格。
 
     为什么不用 ttk.Treeview：Treeview 由系统主题绘制，背景是实色，
     铺不上玻璃底；而且行高、选中色、字体都无法精确控制。
     这个实现保持了 Treeview 的一小部分接口（get_children / insert / delete /
-    selection / item），方便把已有代码迁移过来。
+    selection / selection_set / selection_add / selection_remove / item），
+    方便把已有代码迁移过来。
+
+    ⚠️ **`insert()` 不会立刻重绘**，只在空闲时（`after_idle`）合并重绘一次 ——
+    批量灌几百行时逐行重绘会卡住界面。需要"插完马上看到"的场合
+    （比如自检、截图、`--shot`），请显式调一次 `redraw()`；否则在事件循环
+    跑起来之前画布上会是空的（这个坑真的踩过：表头显示「共 339 个进程」，
+    下面一行都没有）。
     """
 
     ROW_H = 27
@@ -329,6 +646,7 @@ class GlassTable:
         self._tags = {}
         self._bg_photo = None
         self._row_imgs = {}
+        self._dirty = False     # 是否已有排队的空闲重绘
 
         self.cv.bind("<MouseWheel>", self._on_wheel)
         self.cv.bind("<Button-4>", lambda e: self._scroll(-3))
@@ -344,6 +662,42 @@ class GlassTable:
 
     def selection(self):
         return tuple(self.sel)
+
+    @staticmethod
+    def _as_ids(items):
+        """把 "123" / 123 / ("1","2") 统一成字符串列表。"""
+        if items is None:
+            return []
+        if isinstance(items, (str, int)):
+            return [str(items)]
+        return [str(i) for i in items]
+
+    def selection_set(self, items):
+        """整体替换选中项（Treeview 兼容）。"""
+        self.sel = set(self._as_ids(items))
+        self.redraw()
+
+    def selection_add(self, items):
+        """追加选中项（等价于按住 Ctrl 点选）。"""
+        self.sel |= set(self._as_ids(items))
+        self.redraw()
+
+    def selection_remove(self, items):
+        """取消选中。"""
+        self.sel -= set(self._as_ids(items))
+        self.redraw()
+
+    def selection_toggle(self, iid):
+        """点一下切换选中态，返回切换后的状态。"""
+        iid = str(iid)
+        if iid in self.sel:
+            self.sel.discard(iid)
+            on = False
+        else:
+            self.sel.add(iid)
+            on = True
+        self.redraw()
+        return on
 
     def item(self, iid, opt=None):
         for r in self.rows:
@@ -366,6 +720,10 @@ class GlassTable:
         self.redraw()
 
     def insert(self, parent, index, iid=None, tags=(), values=()):
+        """追加一行。**不立刻重绘**，只排一次空闲重绘（批量灌数据友好）。
+
+        需要"插完立刻可见"时请显式调 `redraw()`。
+        """
         name, pid = values[0], values[1]
         memtxt, note = values[2], values[3]
         try:
@@ -374,6 +732,30 @@ class GlassTable:
             ws = 0
         tag = tags[0] if tags else "normal"
         self.rows.append((name, pid, ws, tag, note))
+        self._schedule_redraw()
+
+    def _schedule_redraw(self):
+        """把 N 次 insert 合并成一次重绘：只排一个 after_idle。
+
+        没有这一步，`delete() → 批量 insert()` 之后画布会一直停在"已清空"
+        的状态，表头写着「共 339 个进程」而下面一行都没有 —— 直到鼠标划过
+        表格（`_set_hover` 触发重绘）才突然出现。
+        """
+        if self._dirty:
+            return
+        self._dirty = True
+        try:
+            self.cv.after_idle(self._flush_redraw)
+        except Exception:
+            self._dirty = False
+
+    def _flush_redraw(self):
+        self._dirty = False
+        try:
+            if self.cv.winfo_exists():
+                self.redraw()
+        except Exception:
+            pass
 
     def tag_configure(self, tag, **kw):
         self._tags[tag] = kw
@@ -463,6 +845,9 @@ class GlassTable:
 
         rows = self.rows
         n_vis = self.visible_rows()
+        # 行数变少后滚动位置必须夹回来：否则 top 停在旧的最大值上，
+        # `idx >= end` 立刻 break，整张表一行都画不出来
+        self.top = max(0, min(self.top, max(0, len(rows) - n_vis)))
         end = min(len(rows), self.top + n_vis)
 
         for i in range(n_vis):

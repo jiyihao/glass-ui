@@ -34,6 +34,10 @@ class GlassEngine:
 
     BLUR = 30            # 高斯模糊半径。太小像磨砂贴膜，太大看不出桌面
     VEIL = 0.74          # 深色面纱强度。越低越透、文字越难读
+    VEIL_DEFAULT = 0.74  # 出厂值，`glass_k` 用它做归一化；改它等于改整条基线
+    VEIL_MIN = 0.42      # 透明度 100% 时的面纱强度
+    VEIL_MAX = 0.96      # 透明度 0% 时的面纱强度
+    OPACITY_DEFAULT = 74 # 用户侧的默认透明度（百分比），与 VEIL_DEFAULT 对应
     CARD_R = R_CARD
     WIN_R = R_WIN
     TITLE_H = 58         # 顶部标题栏高度，0 表示不要标题栏底色
@@ -41,6 +45,77 @@ class GlassEngine:
     def __init__(self):
         self.src = None
         self.ok = HAVE_PIL
+        # 下面这些原本都是类属性。遮罩系数需要在运行期被「界面设置」改掉，
+        # 而类属性一改会波及所有实例，所以统一复制一份到实例上。
+        self.BLUR = type(self).BLUR
+        self.VEIL = type(self).VEIL
+        self.CARD_R = type(self).CARD_R
+        self.WIN_R = type(self).WIN_R
+        self.TITLE_H = type(self).TITLE_H
+
+    # --------------------------------------------------- 透明度 / 玻璃强度
+    @classmethod
+    def opacity_to_veil(cls, opacity):
+        """用户语义的「透明度 0~100」→ 引擎的面纱系数。
+
+        两者是反向的：透明度越大 → 面纱越薄（系数越小）→ 越通透。
+        三个锚点由产品定义，必须同时命中，因此按 74 分段线性插值：
+
+        ========  ==========  ==============================
+        透明度     面纱系数     说明
+        ========  ==========  ==============================
+        0         0.96        磨砂感最强
+        74        0.74        出厂值，与本库硬编码的历史值一致
+        100       0.42        最通透，能看清后方桌面
+        ========  ==========  ==============================
+        """
+        try:
+            o = float(opacity)
+        except (TypeError, ValueError):
+            o = float(cls.OPACITY_DEFAULT)
+        o = max(0.0, min(100.0, o))
+        pivot = float(cls.OPACITY_DEFAULT)
+        if o >= pivot:
+            t = (o - pivot) / max(1e-6, 100.0 - pivot)
+            return cls.VEIL_DEFAULT + t * (cls.VEIL_MIN - cls.VEIL_DEFAULT)
+        t = o / max(1e-6, pivot)
+        return cls.VEIL_MAX + t * (cls.VEIL_DEFAULT - cls.VEIL_MAX)
+
+    @classmethod
+    def veil_to_opacity(cls, veil):
+        """`opacity_to_veil` 的逆运算，给自检与持久化回读用。"""
+        try:
+            v = float(veil)
+        except (TypeError, ValueError):
+            v = cls.VEIL_DEFAULT
+        v = max(cls.VEIL_MIN, min(cls.VEIL_MAX, v))
+        if v <= cls.VEIL_DEFAULT:
+            span = max(1e-6, cls.VEIL_DEFAULT - cls.VEIL_MIN)
+            t = (cls.VEIL_DEFAULT - v) / span
+            return float(cls.OPACITY_DEFAULT) + t * (100.0 - cls.OPACITY_DEFAULT)
+        span = max(1e-6, cls.VEIL_MAX - cls.VEIL_DEFAULT)
+        t = (cls.VEIL_MAX - v) / span
+        return float(cls.OPACITY_DEFAULT) * t
+
+    def set_opacity(self, opacity):
+        """按用户语义设置透明度，返回实际生效的百分比（已夹到 0~100）。"""
+        self.VEIL = self.opacity_to_veil(opacity)
+        return int(round(self.veil_to_opacity(self.VEIL)))
+
+    @property
+    def glass_k(self):
+        """玻璃强度系数 = 当前面纱 / 出厂面纱。出厂值恒为 1.0。
+
+        卡片填充、描边、按钮底面都是「白色 + 极低 alpha」的薄层，
+        不能写死：面纱变薄后底图更亮，同样的 alpha 会糊得看不见；
+        面纱变厚则要更亮一点才能维持层次。所有这类 alpha 都乘这个系数，
+        出厂值下乘 1，输出与历史版本逐像素一致。
+        """
+        try:
+            k = float(self.VEIL) / float(self.VEIL_DEFAULT)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 1.0
+        return max(0.35, min(1.75, k))
 
     # ------------------------------------------------------------------ 抓屏
     def grab(self, x, y, w, h):
@@ -82,7 +157,7 @@ class GlassEngine:
         img = ImageEnhance.Brightness(img).enhance(0.96)
 
         veil = Image.new("RGB", (w, h), (13, 15, 23))
-        img = Image.blend(img, veil, self.VEIL)
+        img = Image.blend(img, veil, max(0.0, min(1.0, float(self.VEIL))))
         img = self._glow(img)
         img = self._sheen(img)
         img = self._noise(img)
@@ -157,49 +232,58 @@ class GlassEngine:
         if not cards:
             return img
         w, h = img.size
+        k = self.glass_k
         sh = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         ds = ImageDraw.Draw(sh)
         for (x, y, cw, ch) in cards:
             # 往下偏移 6px 再模糊，做出"卡片浮在玻璃上"的投影
             ds.rounded_rectangle([x + 2, y + 6, x + cw - 2, y + ch + 8],
-                                 radius=self.CARD_R, fill=(0, 0, 0, 120))
+                                 radius=self.CARD_R,
+                                 fill=(0, 0, 0, int(120 * k)))
         sh = sh.filter(ImageFilter.GaussianBlur(14))
         return Image.alpha_composite(img, sh)
 
     def _glass(self, img, cards):
         w, h = img.size
+        k = self.glass_k
         gl = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(gl)
 
         # 标题栏：比卡片更亮，突出"顶盖"层次
         if self.TITLE_H > 0:
-            d.rectangle([0, 0, w, self.TITLE_H], fill=(255, 255, 255, 12))
+            d.rectangle([0, 0, w, self.TITLE_H],
+                        fill=(255, 255, 255, int(12 * k)))
             for i in range(self.TITLE_H):
                 t = 1.0 - i / float(self.TITLE_H)
-                d.line([(0, i), (w, i)], fill=(255, 255, 255, int(18 * t * t)))
+                d.line([(0, i), (w, i)],
+                       fill=(255, 255, 255, int(18 * k * t * t)))
             d.line([(0, self.TITLE_H), (w, self.TITLE_H)],
-                   fill=(255, 255, 255, 30))
+                   fill=(255, 255, 255, int(30 * k)))
 
-        # 卡片本体：白色极低 alpha 填充 + 双层描边
+        # 卡片本体：白色极低 alpha 填充 + 双层描边。alpha 随面纱系数缩放，
+        # 否则调到最通透时卡片边界会整个消失
         for (x, y, cw, ch) in cards:
             d.rounded_rectangle([x, y, x + cw, y + ch],
-                                radius=self.CARD_R, fill=(255, 255, 255, 16))
+                                radius=self.CARD_R,
+                                fill=(255, 255, 255, int(16 * k)))
             d.rounded_rectangle([x, y, x + cw, y + ch], radius=self.CARD_R,
-                                outline=(255, 255, 255, 52), width=1)
+                                outline=(255, 255, 255, int(52 * k)), width=1)
             d.rounded_rectangle([x + 1, y + 1, x + cw - 1, y + ch - 1],
                                 radius=self.CARD_R - 1,
-                                outline=(255, 255, 255, 14), width=1)
+                                outline=(255, 255, 255, int(14 * k)), width=1)
 
         return Image.alpha_composite(img, gl)
 
     def card_glow(self, cw, ch):
         """卡片内部顶部柔光，给一点"厚度"感。返回独立小图层。"""
+        k = self.glass_k
         top_h = max(2, int(ch * 0.55))
         g = Image.new("RGBA", (cw, top_h), (0, 0, 0, 0))
         gd = ImageDraw.Draw(g)
         for i in range(top_h):
             t = 1.0 - i / float(top_h)
-            gd.line([(0, i), (cw, i)], fill=(255, 255, 255, int(11 * t * t)))
+            gd.line([(0, i), (cw, i)],
+                    fill=(255, 255, 255, int(11 * k * t * t)))
         m = Image.new("L", (cw, top_h), 0)
         ImageDraw.Draw(m).rounded_rectangle(
             [0, 0, cw - 1, top_h + self.CARD_R], radius=self.CARD_R, fill=255)
@@ -256,16 +340,19 @@ class GlassEngine:
         band.paste(g, (0, 0))
         return Image.alpha_composite(layer, band)
 
-    @classmethod
-    def _paint_button(cls, img, x, y, w, h, kind, state):
+    def _paint_button(self, img, x, y, w, h, kind, state):
         """按钮底面：按按钮尺寸建独立小图层画完，再贴回大图。
 
         注意 `Image.alpha_composite` 没有 `dest` 参数（Pillow 13 实测），
         在指定位置合成只能靠 crop → composite → paste。
+
+        ghost 按钮的底面是半透明白，alpha 要跟着面纱系数走；primary 按钮
+        是实色渐变，不受影响。
         """
         w, h = int(w), int(h)
         if w <= 1 or h <= 1:
             return img
+        k = self.glass_k
         r = h / 2.0
         layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
@@ -281,19 +368,20 @@ class GlassEngine:
                        fill=(int(top[0] + (bot[0] - top[0]) * t),
                              int(top[1] + (bot[1] - top[1]) * t),
                              int(top[2] + (bot[2] - top[2]) * t), 255))
-            layer = cls.mask_round(layer, r)
-            layer = cls.gloss(layer, r, 66)
+            layer = self.mask_round(layer, r)
+            layer = self.gloss(layer, r, 66)
             d = ImageDraw.Draw(layer)
             d.rounded_rectangle([0, 0, w - 1, h - 1], radius=r,
                                 outline=(255, 255, 255, 112), width=1)
         else:
-            fill = {"normal": (255, 255, 255, 26), "hover": (255, 255, 255, 48),
-                    "press": (255, 255, 255, 16)}[state]
+            fill = {"normal": (255, 255, 255, int(26 * k)),
+                    "hover": (255, 255, 255, int(48 * k)),
+                    "press": (255, 255, 255, int(16 * k))}[state]
             d.rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=fill)
-            layer = cls.gloss(layer, r, 40)
+            layer = self.gloss(layer, r, int(40 * k))
             d = ImageDraw.Draw(layer)
             d.rounded_rectangle([0, 0, w - 1, h - 1], radius=r,
-                                outline=(255, 255, 255, 70), width=1)
+                                outline=(255, 255, 255, int(70 * k)), width=1)
 
         region = img.crop((x, y, x + w, y + h))
         img.paste(Image.alpha_composite(region, layer), (x, y))

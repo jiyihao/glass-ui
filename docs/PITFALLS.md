@@ -268,6 +268,72 @@ ctypes.windll.shcore.SetProcessDpiAwareness(1)     # Win8.1+
 
 ---
 
+## 18. `AdjustTokenPrivileges` 失败时也返回 TRUE
+
+**症状**：明明以管理员身份运行，`NtSetSystemInformation` 还是返回
+`0xC0000061`（`STATUS_PRIVILEGE_NOT_HELD` = -1073741727），日志里一句
+「清理失败，状态码 -1073741727」看不出任何线索。
+
+**根因**：清理待机内存列表需要 `SeProfileSingleProcessPrivilege`。
+这个特权在管理员令牌里**默认是「存在但未启用」**，必须显式
+`AdjustTokenPrivileges` 打开。而 `AdjustTokenPrivileges` 有个坑：
+**即使一个特权都没分配成功，它照样返回 TRUE**，
+只在 `GetLastError()` 里留下 `ERROR_NOT_ALL_ASSIGNED (1300)`。
+
+只看返回值 → 把失败当成功 → 下一句系统调用报一个毫不相关的错。
+
+**解法**：BOOL 和 last error 两个都要查。
+
+```python
+ok = advapi32.AdjustTokenPrivileges(tok, False, byref(tp), 0, None, None)
+return bool(ok) and ctypes.get_last_error() != 1300
+```
+
+**顺带**：`ShellExecuteW` 拉 UAC 时返回值 `<= 32` 一律是失败
+（`5` = 拒绝访问，`1223` = 用户取消），且必须设
+`restype = ctypes.c_void_p`，否则 64 位下返回值被截断。不看返回值就会出现
+「用户点了『否』→ 程序自己关掉 → 什么都没做」这种最难排查的表现。
+
+---
+
+## 19. 自绘列表：`delete()` 会重绘，`insert()` 不会
+
+**症状**：列表标题写着「共 339 个」，表体一行都没有。动一下鼠标、或者
+拖动/最小化窗口，行又突然全冒出来了。时好时坏，截图还截不出来。
+
+**根因**：`refresh()` 的典型写法是「先 `delete()` 清空，再批量 `insert()`」。
+如果 `delete()` 内部会 `redraw()` 而 `insert()` 不会，那么画布就永久停在
+`delete()` 之后的**空白状态**——数据在内存里是新的，画布是空的。
+只有 `<Motion>` / 窗口重建这类意外触发重绘，行才会出现。
+
+**这是最难发现的一类 bug**：你的截图工具如果恰好会触发一次重建，
+截图看起来完全正常，于是「验证通过」，然后用户一用就发现是空的。
+
+**解法**：
+- `insert()` 里排一次 `after_idle` 合并重绘（339 次插入只重绘 1 次，不卡）；
+- **调用方在批量插入后仍要显式 `redraw()` 一次**，不要依赖事件循环时机，
+  否则 `--shot` / 自检这类不跑 `mainloop()` 的路径拿不到确定性结果；
+- `redraw()` 开头把滚动位置 `top` 夹回 `[0, len(rows)-visible]`。
+  行数变少后 `top` 停在旧最大值上，`idx >= end` 立刻 break，**整表一行都画不出来**。
+
+---
+
+## 20. `glass_slices()` 里别用 `winfo_*` 取坐标
+
+**症状**：某个控件（开关、小图标按钮）右下角总有一块深色方块，其他控件却正常。
+
+**根因**：`glass_slices()` 要给每个自绘控件切一块背景贴图。如果某处用了
+`cv.winfo_x() / winfo_width()` 取坐标，而这时窗口**还没映射**，这些方法返回
+`1` → 裁出 1×1 的背景 → 控件画布底色 `#0b0d13` 从圆角外露出来，就是黑方块。
+
+这和第 15 条是同一个根因的两种表现：第 15 条坑的是主窗口尺寸，
+这里坑的是子控件坐标。
+
+**解法**：`glass_slices()` 里一律用创建控件时**记录的确定值**（比如布局字典里的
+`(x, y, w, h)`），不要回过头去问 Tk。实在要问，也要先判 `> 1`。
+
+---
+
 ## 调界面时的建议
 
 1. **必须放大截图逐像素核对**，不能靠代码"应该没问题"。第 2、3 条那两个
@@ -281,3 +347,18 @@ from PIL import Image
 im = Image.open("shot.png").convert("RGB")
 print(im.getpixel((60, 553)))
 ```
+
+4. **截图正常 ≠ 没有 bug。** 截图模式通常会额外触发一次背景重建
+   （`--shot` 里调 `rebuild_background()` 是为了拿到完整底图），
+   而重建会顺手把一些「依赖重绘才可见」的内容补画出来——第 19 条那个
+   「表头有数字、表体空白」的 bug 就是这样被截图掩盖的。
+
+   **凡涉及自绘列表 / 画布图元的验证，要直接数图元，不要用眼睛看截图：**
+
+```python
+items = table.cv.find_all()
+texts = [i for i in items if table.cv.type(i) == "text"]
+assert len(texts) > 0, "表格画布上没有文字图元"
+```
+
+   而且要走**真实交互路径**（模拟点按钮触发刷新），不要只跑截图模式。

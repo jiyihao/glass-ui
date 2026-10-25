@@ -160,8 +160,9 @@ Demo(root).run()
 | 控件 | 说明 |
 |---|---|
 | `GlassButton` | 胶囊按钮，`primary` / `ghost` 两种；自带常态 / 悬停 / 按下三态贴图 |
-| `IconButton` | 标题栏圆形图标按钮（最小化 / 关闭 / 帮助） |
+| `IconButton` | 标题栏圆形图标按钮（最小化 / 关闭 / 帮助 / 齿轮），可指定 `glyph_font` |
 | `GlassToggle` | iOS 风格开关，轨道渐变 + 滑块投影 + 球体明暗 |
+| `GlassSlider` | 圆角轨道 + 渐变填充 + 圆形滑块头；`on_drag` 实时、`on_change` 松手 |
 | `GlassTable` | 自绘可滚动表格，行底纹是内缩圆角条；带 Treeview 的一个子集接口 |
 | `GlassLog` | 只读日志，时间戳等宽字体，正文按 tag 上色 |
 | `GlassWindow` | 无边框圆角窗口基类，附带 `ask()` / `info()` 玻璃弹窗 |
@@ -178,7 +179,7 @@ table.NOTE_FG = {"warn": C_ORANGE}                       # tag -> 备注列颜�
 
 ## 调参
 
-`GlassEngine` 上的类属性就是全部的旋钮：
+`GlassEngine` 上的这些旋钮，每个窗口实例各有一份（改实例不会污染类和别的窗口）：
 
 | 参数 | 默认 | 效果 |
 |---|---|---|
@@ -196,6 +197,30 @@ app.engine.VEIL = 0.62      # 想更透一点
 app.engine.BLUR = 26
 app.rebuild_background()
 ```
+
+### 让用户自己调透明度
+
+如果你的程序想给用户一个「玻璃强度」滑块，别直接暴露 `VEIL`——
+它越大越**不**透明，用户看着是反的。用这两个换算函数，语义才符合直觉：
+
+```python
+from glass_ui import GlassEngine
+
+GlassEngine.opacity_to_veil(100)   # 0.42  ← 100 = 最通透
+GlassEngine.opacity_to_veil(74)    # 0.74  ← 默认值，与出厂观感一致
+GlassEngine.opacity_to_veil(0)     # 0.96  ← 0 = 最磨砂
+
+# 或者直接把它交给窗口，在 build_ui() 之前生效
+app = MyWindow(root, glass_opacity=74)
+app.engine.set_opacity(40)         # 运行期改
+app.rebuild_background()           # 松手后再重建，拖动时别每帧重建
+```
+
+`set_opacity()` 会同时缩放背景遮罩、卡片投影与玻璃强度、以及按钮底面贴图的
+alpha。**按钮贴图是烘出来的，改完要调 `GlassButton.rebuild_images()`**，
+否则按钮层次会和背景脱节。
+
+出厂值下 `glass_k == 1.0`，所有缩放系数都乘 1，渲染与没有这个功能时逐像素一致。
 
 字号、配色在 `glass_ui/theme.py`，都是普通常量，直接改或覆盖即可。
 

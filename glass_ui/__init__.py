@@ -38,15 +38,16 @@ from .shapes import hairline, pill_grad, rrect
 from .theme import (C_ACCENT, C_BG, C_CYAN, C_FG, C_FG_DIM, C_FG_FAINT,
                     C_GREEN, C_ORANGE, C_PANEL, C_PURPLE, C_RED, FONT_MONO,
                     FONT_UI, LOG_COLORS, R_CARD, R_WIN)
-from .widgets import (GlassButton, GlassLog, GlassTable, GlassToggle,
-                      IconButton, VarText)
+from .widgets import (GlassButton, GlassLog, GlassSlider, GlassTable,
+                      GlassToggle, IconButton, VarText)
 from .window import GlassWindow
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "GlassEngine", "GlassWindow",
-    "GlassButton", "IconButton", "GlassToggle", "GlassTable", "GlassLog",
+    "GlassButton", "IconButton", "GlassToggle", "GlassSlider",
+    "GlassTable", "GlassLog",
     "VarText",
     "rrect", "pill_grad", "hairline",
     "HAVE_PIL",

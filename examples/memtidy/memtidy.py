@@ -34,7 +34,9 @@ PageOtherTest.MemoryOptimize 被替换为空实现（提示"开源内容中不�
 
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -48,13 +50,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))
 # 界面全部来自 glass-ui：抓屏、模糊、圆角窗口、自绘控件都不在本文件里
 from glass_ui import (C_ACCENT, C_BG, C_CYAN, C_GREEN, C_ORANGE, C_RED,
                       FONT_MONO, FONT_UI, GlassButton, GlassEngine, GlassLog,
-                      GlassTable, GlassToggle, GlassWindow, IconButton,
-                      pill_grad, rrect)
+                      GlassSlider, GlassTable, GlassToggle, GlassWindow,
+                      IconButton, pill_grad, rrect)
 from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
-from glass_ui.win import apply_round_region
+from glass_ui.win import apply_round_region, set_capture_affinity
 
 APP_NAME = "内存整理器"
-APP_VER = "2.0"
+APP_VER = "2.1"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -77,12 +79,70 @@ COLS = (
 )
 
 # ============================================================================
+#  设置持久化
+# ============================================================================
+SETTINGS_DIR = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "MemTidy")
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+
+# glass_opacity：界面透明度百分比。100 = 最通透，0 = 磨砂感最强。
+# 74 是出厂值，对应玻璃库历史上的 VEIL = 0.74，界面与旧版完全一致。
+DEFAULT_SETTINGS = {"glass_opacity": 74}
+OPACITY_RANGE = (0, 100)
+
+
+def load_settings():
+    """读取设置文件，任何异常都静默回落到默认值。
+
+    这个函数在窗口构造的最前面调用，绝对不能抛异常 —— 一旦抛出，
+    `--windowed` 打包的程序没有控制台，用户看到的就是「双击图标毫无反应」。
+    文件缺失、JSON 损坏、值越界、类型不对，一律当默认值处理。
+    """
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return data
+    if not isinstance(raw, dict):
+        return data
+
+    for key, default in DEFAULT_SETTINGS.items():
+        val = raw.get(key, default)
+        # bool 是 int 的子类：{"glass_opacity": true} 会被 int(True) 悄悄变成
+        # 1% —— 用户手改配置或别的程序写入 true 时就"最磨砂"了，直接回落默认
+        if isinstance(val, bool):
+            val = default
+        else:
+            try:
+                val = int(round(float(val)))
+            except (TypeError, ValueError):
+                val = default
+        data[key] = max(OPACITY_RANGE[0], min(OPACITY_RANGE[1], val))
+    return data
+
+
+def save_settings(data):
+    """原子写入设置文件（先写临时文件再 replace）。失败返回 False，不抛异常。"""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+        return True
+    except Exception:
+        return False
+
+# ============================================================================
 #  Win32 接口
 # ============================================================================
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
 ntdll = ctypes.WinDLL("ntdll")
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -95,6 +155,73 @@ kernel32.GlobalMemoryStatusEx.restype = wt.BOOL
 kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
 kernel32.OpenProcess.restype = wt.HANDLE
 kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wt.HANDLE
+
+# NTSTATUS 是 32 位有符号整数，用 c_long 接才不会在 64 位上被截断成垃圾值
+ntdll.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                         ctypes.c_ulong]
+ntdll.NtSetSystemInformation.restype = ctypes.c_long
+
+# ---- 访问令牌与特权 ----
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY = 0x0008
+SE_PRIVILEGE_ENABLED = 0x00000002
+ERROR_NOT_ALL_ASSIGNED = 1300       # AdjustTokenPrivileges 的"部分特权未分配"
+
+
+class LUID(ctypes.Structure):
+    """本地唯一标识符。`LookupPrivilegeValueW` 的输出就是这个结构。"""
+
+    _fields_ = [
+        ("LowPart", wt.DWORD),
+        ("HighPart", wt.LONG),
+    ]
+
+
+class LUID_AND_ATTRIBUTES(ctypes.Structure):
+    """一个 LUID 加属性位（SE_PRIVILEGE_ENABLED 等）。"""
+
+    _fields_ = [
+        ("Luid", LUID),
+        ("Attributes", wt.DWORD),
+    ]
+
+
+class TOKEN_PRIVILEGES(ctypes.Structure):
+    """TOKEN_PRIVILEGES。这里一次只启用一条特权，数组长度固定为 1。"""
+
+    _fields_ = [
+        ("PrivilegeCount", wt.DWORD),
+        ("Privileges", LUID_AND_ATTRIBUTES * 1),
+    ]
+
+
+advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                      ctypes.POINTER(wt.HANDLE)]
+advapi32.OpenProcessToken.restype = wt.BOOL
+advapi32.LookupPrivilegeValueW.argtypes = [wt.LPCWSTR, wt.LPCWSTR,
+                                           ctypes.POINTER(LUID)]
+advapi32.LookupPrivilegeValueW.restype = wt.BOOL
+advapi32.AdjustTokenPrivileges.argtypes = [
+    wt.HANDLE, wt.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES), wt.DWORD,
+    ctypes.c_void_p, ctypes.c_void_p]
+advapi32.AdjustTokenPrivileges.restype = wt.BOOL
+
+# ShellExecuteW 返回 HINSTANCE（指针）。restype 留默认的 c_int 会在 64 位下
+# 把返回值截断，错误码判断就全错 —— 必须显式声明成 c_void_p。
+shell32.ShellExecuteW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR,
+                                  wt.LPCWSTR, wt.LPCWSTR, ctypes.c_int]
+shell32.ShellExecuteW.restype = ctypes.c_void_p
+shell32.IsUserAnAdmin.argtypes = []
+shell32.IsUserAnAdmin.restype = wt.BOOL
+
+SHELLEXEC_NOERROR = 32      # ShellExecuteW 返回值 > 32 才算成功
+ERROR_ACCESS_DENIED = 5     # 用户在 UAC 里点了「否」/ 策略不允许提权
+ERROR_CANCELLED = 1223      # 用户关掉了 UAC 对话框
+# 这两个错误码在数值上可能大于 32（1223 > 32），所以不能只靠大小判断，
+# 必须显式排除，否则"用户取消"会被当成"提权成功"
+SHELLEXEC_FAILURE_CODES = frozenset({0, ERROR_ACCESS_DENIED, ERROR_CANCELLED})
 
 
 class MEMORYSTATUSEX(ctypes.Structure):
@@ -154,13 +281,43 @@ def is_admin():
 
 
 def relaunch_as_admin():
-    """以管理员身份重启自己（用于清理待机内存）。"""
+    """以管理员身份重启自己（用于清理待机内存）。
+
+    `ShellExecuteW` 的返回值是 HINSTANCE，**不是** 布尔：`> 32` 才算成功，
+    其余都是错误码（5 = 拒绝访问，即用户在 UAC 里点了「否」；
+    1223 = 用户取消）。老实现不看返回值直接 `return True`，于是用户点了
+    「否」之后调用方会走到 `self.close()` —— 窗口凭空消失，什么都没做，
+    用户完全不知道发生了什么。
+
+    Returns:
+        (ok, code)：ok 为 True 表示新进程已经拉起；code 是 ShellExecuteW
+        的原始返回值（失败时用于区分"用户取消"和"提权被拒"）。
+    """
     try:
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, "", os.path.dirname(sys.executable), 1)
-        return True
+        if getattr(sys, "frozen", False):
+            # 打包后 sys.executable 就是 exe 本身
+            exe = sys.executable
+            params = ""
+            workdir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            # 脚本方式运行：sys.executable 是解释器，必须把脚本和原参数带上，
+            # 否则只会拉起一个裸 python.exe（什么都不开）
+            script = os.path.abspath(sys.argv[0])
+            exe = sys.executable
+            params = subprocess.list2cmdline([script] + sys.argv[1:])
+            workdir = os.path.dirname(script)
+
+        ctypes.set_last_error(0)
+        rc = shell32.ShellExecuteW(None, "runas", exe, params, workdir, 1)
+        code = int(rc or 0)
+        if code > SHELLEXEC_NOERROR and code not in SHELLEXEC_FAILURE_CODES:
+            return True, code
+        if code == 0:
+            # 返回 0 时真正的错误码在 last error 里
+            code = ctypes.get_last_error() or 0
+        return False, code
     except Exception:
-        return False
+        return False, -1
 
 
 def get_memory_status():
@@ -255,11 +412,105 @@ def empty_working_set(pid):
         kernel32.CloseHandle(h)
 
 
+def enable_privilege(name):
+    """启用当前进程令牌中的一个特权，成功返回 True。
+
+    为什么需要它：`SeProfileSingleProcessPrivilege`、`SeDebugPrivilege` 这类
+    特权在管理员令牌里也是「存在但未启用」状态（默认只启用
+    SeChangeNotifyPrivilege / SeIncreaseWorkingSetPrivilege 等少数几个）。
+    必须自己 `AdjustTokenPrivileges` 打开，系统调用才不会返回
+    0xC0000061 STATUS_PRIVILEGE_NOT_HELD。
+
+    另一个坑：`AdjustTokenPrivileges` 在「部分特权未分配」时仍返回 TRUE，
+    真正的结论在 GetLastError 里 —— 必须查 ERROR_NOT_ALL_ASSIGNED(1300)。
+
+    Args:
+        name: 特权名，如 "SeProfileSingleProcessPrivilege"。
+
+    Returns:
+        True 表示该特权此刻处于启用状态；False 表示打开失败（权限不足、
+        被组策略剥夺、或调用了不存在的特权名）。
+    """
+    token = wt.HANDLE()
+    try:
+        opened = advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            ctypes.byref(token))
+    except Exception:
+        return False
+    if not opened:
+        return False
+
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return False
+
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+        ctypes.set_last_error(0)
+        ok = advapi32.AdjustTokenPrivileges(
+            token, False, ctypes.byref(tp), 0, None, None)
+        err = ctypes.get_last_error()
+        if not ok:
+            return False
+        return err != ERROR_NOT_ALL_ASSIGNED
+    except Exception:
+        return False
+    finally:
+        try:
+            kernel32.CloseHandle(token)
+        except Exception:
+            pass
+
+
 def purge_standby_list():
-    """清空待机内存列表，需管理员权限。返回 (成功, 状态码)。"""
+    """清空待机内存列表（NtSetSystemInformation / MemoryPurgeStandbyList）。
+
+    这个接口要求调用进程的令牌里 **SeProfileSingleProcessPrivilege 处于启用
+    状态**。关键点在于：即便是管理员账户，该特权在令牌里默认也是
+    「存在但未启用」（SE_PRIVILEGE_ENABLED_BY_DEFAULT 不含它），必须显式
+    `AdjustTokenPrivileges` 打开，否则内核直接返回 0xC0000061
+    （STATUS_PRIVILEGE_NOT_HELD）。历史版本漏了这一步，所以管理员也必然失败。
+
+    Returns:
+        (ok, status, reason)
+            ok     : 布尔，系统调用是否返回 STATUS_SUCCESS。
+            status : NTSTATUS 原始值（成功时为 0）。
+            reason : 失败原因分类，取值
+                     "ok" / "no_admin"（缺管理员权限）/
+                     "no_privilege"（特权启用失败，如被组策略剥夺）/
+                     "system"（系统调用返回其它错误码）。
+    """
+    priv_on = enable_privilege("SeProfileSingleProcessPrivilege")
+
     cmd = ctypes.c_int(4)  # MemoryPurgeStandbyList
-    st = ntdll.NtSetSystemInformation(80, ctypes.byref(cmd), ctypes.sizeof(cmd))
-    return st == 0, st
+    status = int(ntdll.NtSetSystemInformation(
+        80, ctypes.byref(cmd), ctypes.sizeof(cmd)))
+
+    if status == 0:
+        return True, 0, "ok"
+    if not is_admin():
+        return False, status, "no_admin"
+    if not priv_on:
+        return False, status, "no_privilege"
+    return False, status, "system"
+
+
+def purge_reason_text(reason, status):
+    """把 purge_standby_list 的失败原因翻译成给用户看的一句话。"""
+    if reason == "no_admin":
+        return "需要管理员权限，是否以管理员身份重启？"
+    if reason == "no_privilege":
+        return ("无法启用 SeProfileSingleProcessPrivilege"
+                "（可能被组策略限制）")
+    if reason == "system":
+        return "系统调用返回 0x%08X" % (int(status) & 0xFFFFFFFF)
+    return "未知原因"
 
 
 def kill_process(pid):
@@ -336,7 +587,28 @@ class MemTidyApp(GlassWindow):
         self.txt_admin = ""
         self.var_purge = tk.BooleanVar(value=True)
 
-        super().__init__(root, shot=shot, title=APP_TITLE)
+        # 设置必须在 super().__init__ 之前读好：按钮底面的 alpha 是烘进贴图的，
+        # build_ui() 里创建的按钮要拿到正确的玻璃强度
+        self.settings = load_settings()
+
+        # 设置弹窗的运行时状态
+        self._settings_win = None
+        self._settings_cv = None
+        self._settings_size = (0, 0)
+        self._settings_plate = None
+        self._settings_plate_item = None
+        self._settings_plate_img = None
+        self._settings_hair = None
+        self._settings_pct_item = None
+        self._settings_slider = None
+        self._settings_btn_done = None
+        self._settings_btn_reset = None
+        self._settings_slider_xy = (0, 0)
+        self._settings_hidden = False
+        self._bg_debounce = None
+
+        super().__init__(root, shot=shot, title=APP_TITLE,
+                         glass_opacity=self.settings["glass_opacity"])
 
         self._refresh_admin()
         self.refresh_memory()
@@ -399,11 +671,16 @@ class MemTidyApp(GlassWindow):
         ]
         for b in self._all_buttons():
             out.append((b, b.x, b.y, b.w, b.h))
-        for ic in (self.btn_min, self.btn_close, self.btn_about):
-            out.append((ic, ic.x, ic.y, ic.size, ic.size))
+        # getattr 兜底：给控件加一次漏一次会把圆角外的深色方块露出来，
+        # 所以这里宁可跳过也不能 AttributeError 整段失效
+        for name in ("btn_min", "btn_close", "btn_about", "btn_settings"):
+            ic = getattr(self, name, None)
+            if ic is not None:
+                out.append((ic, ic.x, ic.y, ic.size, ic.size))
         t = self.toggle
-        out.append((t, t.cv.winfo_x(), t.cv.winfo_y(),
-                    t.cv.winfo_width(), t.cv.winfo_height()))
+        tgx, tgy, tgw, tgh = self.geo.get("toggle", (0, 0, 0, 0))
+        if tgw > 0 and tgh > 0:
+            out.append((t, tgx, tgy, tgw, tgh))
         return out
 
     def build_ui(self):
@@ -463,13 +740,50 @@ class MemTidyApp(GlassWindow):
 
         self.toggle = GlassToggle(self, self.var_purge, w - 248, by + 6,
                                   "整理后清理待机")
+        # 开关的几何写进 geo：它的画布比轨道宽（左右留白 + 右侧标签），
+        # 尺寸由控件自己算，但坐标必须记下来 —— 背景切片靠它裁，
+        # 不能用 winfo_*（窗口还没映射时那是 1×1，会裁出一块黑方块）
+        self.geo["toggle"] = (w - 248, by + 6,
+                              self.toggle.cw + self.toggle.label_w,
+                              self.toggle.ch)
 
-        # 标题栏图标按钮
+        # 标题栏图标按钮。右侧四个键从外往内：关闭(w-42) / 最小化(w-76) /
+        # 帮助(w-110) / 设置(w-144)，互相之间留 4px
         self.btn_close = IconButton(self, "✕", self.close, w - 42, 14, danger=True)
         self.btn_min = IconButton(self, "—", self.minimize, w - 76, 14)
         self.btn_about = IconButton(self, "?", lambda: self.show_about(), w - 110, 14)
+        gear_text, gear_font = self._gear_glyph()
+        self.btn_settings = IconButton(self, gear_text, self.show_settings,
+                                       w - 144, 14, glyph_font=gear_font)
 
         self.draw_chrome()
+
+    @staticmethod
+    def _gear_glyph():
+        """挑一个能真正画出齿轮的字体，返回 (字形, 字体)。
+
+        只看字体名是不够的：雅黑、Segoe UI、Consolas 都没有 U+2699，缺字形时
+        Tk 会拿私用区占位字形（U+E000）顶上，画出来就是一个豆腐块（QA 用位图
+        差分证明过）。而它们的 `measure("⚙")` 与 `measure("\\uE000")` 又互不
+        相等（实测 22 vs 13），所以**量宽无法可靠判定缺字**。
+
+        与其猜，不如只认 Windows 自带的 Segoe UI Symbol（实测它确实含
+        U+2699：measure = 13，和占位字形不同）；没有这个字体就退化成文字
+        「设置」，保证用户看得懂，绝不画豆腐块。
+        """
+        probe, tofu = "\u2699", "\uE000"
+        try:
+            fams = set(tkfont.families())
+        except Exception:
+            fams = set()
+        if "Segoe UI Symbol" in fams:
+            try:
+                f = tkfont.Font(family="Segoe UI Symbol", size=12)
+                if f.measure(probe) > 0 and f.measure(probe) != f.measure(tofu):
+                    return probe, ("Segoe UI Symbol", 12)
+            except Exception:
+                pass
+        return "设置", (FONT_UI, 7)
 
     # ---------------- 主绘制 ----------------
     def draw_chrome(self):
@@ -703,6 +1017,9 @@ class MemTidyApp(GlassWindow):
                 tag, note = "normal", ""
             self.table.insert("", "end", iid=str(pid), tags=(tag,), values=(
                 name, pid, f"{ws/1048576:.1f} MB" if ws else "—", note))
+        # 批量插完必须显式重绘一次：GlassTable.insert 只排队一次空闲重绘，
+        # 不在这里落笔的话，点「刷新」之后表头写着「共 N 个进程」而表格是空的
+        self.table.redraw()
         self.txt_count = f"共 {len(rows)} 个可枚举进程"
         self.refresh_memory()
 
@@ -747,14 +1064,17 @@ class MemTidyApp(GlassWindow):
 
         if self.var_purge.get():
             self.log("正在清理待机内存列表 …", "dim")
-            good, st = purge_standby_list()
+            good, st, reason = purge_standby_list()
             if good:
                 self.log("待机内存列表已清空。", "ok")
-            elif not is_admin():
-                self.log(f"待机内存清理失败（状态码 {st}）：需要管理员权限。"
-                         f"可点右上角「?」查看提权方法。", "warn")
             else:
-                self.log(f"待机内存清理失败，状态码 {st}。", "warn")
+                # 三种失败原因必须分开说，否则用户只会看到"失败"两个字，
+                # 不知道是自己没提权、还是特权被组策略摘掉了
+                self.log(f"待机内存清理失败：{purge_reason_text(reason, st)}",
+                         "warn")
+                if reason == "no_admin":
+                    self.log("整理流程不会自行提权：需要时请右键「以管理员身份运行」"
+                             "后再点「清理待机内存」。", "dim")
 
         time.sleep(0.8)
         after = self.refresh_memory_silent()
@@ -801,25 +1121,48 @@ class MemTidyApp(GlassWindow):
         if self.busy:
             return
         before = get_memory_status()
-        good, st = purge_standby_list()
+        good, st, reason = purge_standby_list()
         time.sleep(0.5)
         after = get_memory_status()
         if good:
             self.log(f"待机内存已清空：可用 {before['avail_mb']/1024:.2f} GB → "
                      f"{after['avail_mb']/1024:.2f} GB", "ok")
-        elif not is_admin():
+        elif reason == "no_admin":
+            self.log(f"待机内存清理失败：{purge_reason_text(reason, st)}", "warn")
             if self.ask("需要管理员权限",
                         "清理待机内存需要管理员权限。\n\n是否以管理员身份重新启动本程序？",
                         "以管理员重启", "取消"):
-                if not relaunch_as_admin():
-                    self.info("提权失败", "无法以管理员身份重启，请手动右键选择「以管理员身份运行」。")
-                else:
+                ok, code = relaunch_as_admin()
+                if ok:
+                    # 新实例已经拉起，关掉自己让出位置
                     self.close()
                     return
+                # 失败绝对不能关窗口 —— 否则用户看到的就是程序凭空消失
+                if code == ERROR_CANCELLED:
+                    title = "已取消提权"
+                    msg = ("UAC 对话框被关掉了，提权没有执行，程序继续运行。\n\n"
+                           "需要清理待机内存时，可以右键 exe → 「以管理员身份运行」。")
+                elif code == ERROR_ACCESS_DENIED:
+                    title = "提权被拒绝"
+                    msg = ("系统拒绝了提权请求（错误码 5：拒绝访问）。\n\n"
+                           "通常是在 UAC 对话框里点了「否」，或当前账户不允许提权。"
+                           "可以右键 exe → 「以管理员身份运行」，或在管理员账户下运行。")
+                else:
+                    title = "提权失败"
+                    msg = (f"没能拉起管理员实例（ShellExecute 返回 {code}）。\n\n"
+                           "请右键 exe → 「以管理员身份运行」，再点一次「清理待机内存」。")
+                self.log(f"未能以管理员身份重启（返回 {code}），程序继续运行。", "warn")
+                self.info(title, msg)
             else:
                 self.log("已取消提权。", "dim")
         else:
-            self.log(f"清理失败，状态码 {st}。", "err")
+            self.log(f"待机内存清理失败：{purge_reason_text(reason, st)}", "warn")
+            if reason == "no_privilege":
+                self.info(
+                    "无法启用特权",
+                    "系统拒绝了 SeProfileSingleProcessPrivilege 的启用请求。\n\n"
+                    "通常是组策略或安全软件收紧了这个特权（「配置文件单一进程」）。"
+                    "可以在「本地安全策略 → 用户权限分配」里把它授予当前用户后再试。")
         self.refresh_memory()
 
     # ---------------- 结束进程 ----------------
@@ -867,6 +1210,350 @@ class MemTidyApp(GlassWindow):
                 self.log(f"结束失败 {name} (PID {pid})，可能需要管理员权限", "warn")
         self.log(f"结束进程完成：{okc}/{len(targets)} 成功")
         self.refresh_processes()
+
+    # ---------------- 界面设置：玻璃透明度 ----------------
+    SETTINGS_W = 460
+    SETTINGS_H = 260
+
+    def rebuild_background(self):
+        """重建主窗口背景。设置弹窗打开时先把它藏起来。
+
+        抓屏抓的是屏幕像素，弹窗浮在主窗口上方就会被一起拍进底图
+        （PITFALLS 第 8 条）。WDA_EXCLUDEFROMCAPTURE 在 Win10 2004 以下
+        不生效，所以这里在应用层也兜一道 —— 任何路径触发的重建
+        （拖动窗口、从最小化恢复、改透明度）都会走这个入口。
+        """
+        win = self._settings_win
+        if win is None or self._settings_hidden:
+            return super().rebuild_background()
+        self._settings_hidden = True
+        hidden = False
+        try:
+            win.withdraw()
+            hidden = True
+            self.root.update_idletasks()
+        except Exception:
+            hidden = False
+        try:
+            return super().rebuild_background()
+        finally:
+            if hidden:
+                self._restore_settings_window()
+            self._settings_hidden = False
+
+    def _restore_settings_window(self):
+        """把设置弹窗重新显示出来，并恢复顶层、圆角与抓屏排除。"""
+        win = self._settings_win
+        if win is None:
+            return
+        try:
+            win.deiconify()
+            win.attributes("-topmost", True)
+            win.lift()
+            set_capture_affinity(win, True)
+            apply_round_region(win, 22)
+        except Exception:
+            pass
+
+    def show_settings(self):
+        """打开「界面设置」玻璃弹窗（拖动滑块调界面透明度）。
+
+        设计约束（踩过的坑都在这三条里）：
+
+        1. 弹窗底板复用主窗口已合成的 `_bg_img`，不重新抓屏 —— 重新抓屏会
+           把弹窗自己拍进去（PITFALLS 第 8 条）。
+        2. 弹窗里每个子控件都要 `set_background(plate.crop(...))`，否则圆角外
+           会露出子 Canvas 的深色底，在浅底板上就是一块黑方（第 7 条）。
+        3. 拖动过程中**不重建背景**。重建一次要抓屏 + 高斯模糊，约 45ms，
+           每帧做滑块会跟手变糊；只在松手后 120ms 防抖重建一次。
+        """
+        win = self._settings_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.lift()
+                    return
+            except Exception:
+                pass
+            self._settings_win = None
+
+        dw, dh = self.SETTINGS_W, self.SETTINGS_H
+        pad = 26
+
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+
+        cv = tk.Canvas(win, width=dw, height=dh, bd=0,
+                       highlightthickness=0, bg=C_BG)
+        cv.place(x=0, y=0, width=dw, height=dh)
+
+        self._settings_win = win
+        self._settings_cv = cv
+        self._settings_size = (dw, dh)
+        self._settings_plate = None
+        self._settings_plate_item = None
+        self._settings_plate_img = None
+        self._settings_pct_item = None
+        self._settings_hair = None
+
+        # --- 子控件一次性建好（背景切片是之后统一分发的，晚建就拿不到）---
+        cur = int(self.settings["glass_opacity"])
+        slider_x, slider_y = pad + 2, 120
+        self._settings_slider_xy = (slider_x, slider_y)
+        self._settings_slider = GlassSlider(
+            self, slider_x, slider_y, dw - pad * 2 - 4,
+            value=cur / 100.0,
+            on_change=self._on_opacity_commit,
+            on_drag=self._on_opacity_drag,
+            parent=cv, h=8, knob=18)
+
+        btn_w, btn_h = 96, 34
+        by = dh - btn_h - 20
+        self._settings_btn_done = GlassButton(
+            self, "完成", self._close_settings, dw - pad - btn_w, by,
+            btn_w, btn_h, "primary", parent=cv)
+        self._settings_btn_reset = GlassButton(
+            self, "恢复默认", self._reset_opacity, dw - pad - btn_w * 2 - 10, by,
+            btn_w, btn_h, "ghost", parent=cv)
+
+        px = self.root.winfo_rootx() + max(0, (self.win_w - dw) // 2)
+        py = max(16, self.root.winfo_rooty() + max(20, (self.win_h - dh) // 2))
+        win.geometry(f"{dw}x{dh}+{px}+{py}")
+
+        self._paint_settings_plate()
+
+        win.deiconify()
+        win.attributes("-topmost", True)
+        win.lift()
+        # 主窗口重建背景时不能把弹窗一起拍进去，所以弹窗也要排除抓屏
+        try:
+            set_capture_affinity(win, True)
+        except Exception:
+            pass
+        try:
+            win.update_idletasks()
+            apply_round_region(win, 22)
+        except Exception:
+            pass
+
+    def _paint_settings_plate(self):
+        """重建设置弹窗的底板、静态文字与控件背景切片。
+
+        只在两处调用：打开弹窗时、松手后的防抖重建里。**不要**放进拖动回调 ——
+        一次几十毫秒，滑块会明显卡手。
+        """
+        cv = self._settings_cv
+        if cv is None:
+            return
+        dw, dh = self._settings_size
+        pad = 26
+
+        plate = self.glass_plate(dw, dh, 0.38, radius=22)
+        self._settings_plate = plate
+
+        if plate is not None:
+            tkimg = ImageTk.PhotoImage(plate.convert("RGB"))
+            if self._settings_plate_item is None:
+                self._settings_plate_item = cv.create_image(
+                    0, 0, image=tkimg, anchor="nw")
+            else:
+                cv.itemconfigure(self._settings_plate_item, image=tkimg)
+                cv.tag_lower(self._settings_plate_item)
+            # 必须挂住引用，PhotoImage 被 GC 之后整块底板会消失
+            self._settings_plate_img = tkimg
+
+        # --- 静态元素全部挂在 "s_static" tag 上，重建时先删再画 ---
+        cv.delete("s_static")
+        cv.create_text(pad, 28, text="界面设置", anchor="w", fill="#ffffff",
+                       font=(FONT_UI, 12, "bold"), tags=("s_static",))
+
+        if HAVE_PIL:
+            self._settings_hair = ImageTk.PhotoImage(
+                Image.new("RGBA", (max(2, dw - pad * 2), 1), (255, 255, 255, 34)))
+            cv.create_image(pad, 48, image=self._settings_hair, anchor="nw",
+                            tags=("s_static",))
+
+        # 中文换行只在空格处断（PITFALLS 第 11 条），文案里不留多余空格。
+        # 这句话必须能排在一行内 —— 换成三行会把下面的滑块顶到按钮上去
+        cv.create_text(pad, 62, anchor="nw", fill="#c8cfdc", font=(FONT_UI, 9),
+                       width=dw - pad * 2, tags=("s_static",),
+                       text="数值越大越通透，越小越磨砂，松手后立即生效并记住设置。")
+
+        cv.create_text(pad, 104, text="界面透明度", anchor="w", fill="#98a1b4",
+                       font=(FONT_UI, 9), tags=("s_static",))
+        cv.create_text(pad, 158, text="0% 磨砂", anchor="w", fill="#767f90",
+                       font=(FONT_UI, 8), tags=("s_static",))
+        cv.create_text(dw - pad, 158, text="100% 通透", anchor="e",
+                       fill="#767f90", font=(FONT_UI, 8), tags=("s_static",))
+
+        if self._settings_pct_item is None:
+            self._settings_pct_item = cv.create_text(
+                dw - pad, 104, text="", anchor="e", fill="#ffffff",
+                font=(FONT_MONO, 12, "bold"), tags=("s_pct",))
+
+        # 让滑块头的物理位置与设置值保持一致。拖动中不碰它，否则会和用户的
+        # 手打架（拖动回调也会走到这里）。
+        sl_now = self._settings_slider
+        if sl_now is not None and not getattr(sl_now, "_drag", False):
+            want = max(0.0, min(1.0, self.settings["glass_opacity"] / 100.0))
+            if abs(sl_now.get_value() - want) > 1e-6:
+                sl_now.set_value(want)
+        self._update_settings_pct(self.settings["glass_opacity"])
+
+        # --- 控件背景切片 ---
+        if plate is not None:
+            for b in (self._settings_btn_done, self._settings_btn_reset):
+                if b is None:
+                    continue
+                self._safe_set_bg(b, plate, b.x, b.y, b.w, b.h)
+            sl = self._settings_slider
+            if sl is not None:
+                sx, sy = self._settings_slider_xy
+                self._safe_set_bg(sl, plate, sx, sy, sl.cw, sl.ch)
+
+    @staticmethod
+    def _safe_set_bg(widget, plate, x, y, w, h):
+        """给控件铺底板切片，坐标先夹到图内，避免 crop 越界留下深色边。"""
+        try:
+            iw, ih = plate.size
+            x = max(0, min(iw - 1, int(x)))
+            y = max(0, min(ih - 1, int(y)))
+            w = max(1, min(iw - x, int(w)))
+            h = max(1, min(ih - y, int(h)))
+            widget.set_background(
+                plate.crop((x, y, x + w, y + h)).convert("RGB"))
+        except Exception:
+            pass
+
+    def _update_settings_pct(self, pct):
+        cv = self._settings_cv
+        item = self._settings_pct_item
+        if cv is None or item is None:
+            return
+        try:
+            cv.itemconfigure(item, text=f"{int(round(float(pct)))}%")
+        except Exception:
+            pass
+
+    def _apply_opacity(self, percent, persist=False, rebuild=False):
+        """把用户语义的透明度落到引擎上，返回实际生效的整数百分比。
+
+        Args:
+            percent: 0~100 的透明度（100 最通透）。
+            persist: 是否写入 settings.json。
+            rebuild: 是否立即重建背景。拖动中一律 False —— 走防抖。
+        """
+        pct = self.engine.set_opacity(percent)
+        self.settings["glass_opacity"] = pct
+        if persist:
+            save_settings(self.settings)
+        self._update_settings_pct(pct)
+        if rebuild:
+            try:
+                self.rebuild_background()
+                self._refresh_buttons_style()
+            except Exception:
+                pass
+        return pct
+
+    def _on_opacity_drag(self, value):
+        """拖动中：只改遮罩系数与百分比数字，不重建背景。"""
+        self._apply_opacity(float(value) * 100.0, persist=False)
+
+    def _on_opacity_commit(self, value):
+        """松手：落盘 + 120ms 防抖重建背景。"""
+        self._apply_opacity(float(value) * 100.0, persist=True)
+        self._schedule_settings_rebuild(120)
+
+    def _reset_opacity(self):
+        default = int(DEFAULT_SETTINGS["glass_opacity"])
+        sl = self._settings_slider
+        if sl is not None:
+            try:
+                sl.set_value(default / 100.0)
+            except Exception:
+                pass
+        self._apply_opacity(default, persist=True)
+        self.log(f"界面透明度已恢复默认（{default}%）。", "dim")
+        self._schedule_settings_rebuild(60)
+
+    def _schedule_settings_rebuild(self, delay=120):
+        """松手后延迟重建背景，期间继续拖动会重新计时（防抖）。"""
+        if self._bg_debounce is not None:
+            try:
+                self.root.after_cancel(self._bg_debounce)
+            except Exception:
+                pass
+            self._bg_debounce = None
+        try:
+            self._bg_debounce = self.root.after(delay, self._rebuild_settings_bg)
+        except Exception:
+            self._bg_debounce = None
+
+    def _rebuild_settings_bg(self):
+        """防抖到点后：重建主窗口背景，并让弹窗底板跟上新的色调。
+
+        藏/显弹窗的动作在 `rebuild_background()` 里统一处理，这里不用重复。
+        """
+        self._bg_debounce = None
+        try:
+            self.rebuild_background()
+            self._refresh_buttons_style()
+            self._paint_settings_plate()
+        except Exception:
+            pass
+
+    def _refresh_buttons_style(self):
+        """玻璃强度变了之后重烘按钮底面贴图。
+
+        ghost 按钮的半透明白底是烘进 PhotoImage 的，引擎系数改了不会自动
+        更新，不重烘就会出现"背景变透了、按钮还是原来那层灰"的割裂感。
+        """
+        targets = list(self._all_buttons())
+        for extra in (self._settings_btn_done, self._settings_btn_reset):
+            if extra is not None and extra not in targets:
+                targets.append(extra)
+        for b in targets:
+            try:
+                b.rebuild_images()
+            except Exception:
+                pass
+
+    def _close_settings(self):
+        if self._bg_debounce is not None:
+            try:
+                self.root.after_cancel(self._bg_debounce)
+            except Exception:
+                pass
+            self._bg_debounce = None
+        save_settings(self.settings)
+
+        win = self._settings_win
+        self._settings_win = None
+        self._settings_cv = None
+        self._settings_slider = None
+        self._settings_btn_done = None
+        self._settings_btn_reset = None
+        self._settings_pct_item = None
+        self._settings_plate_item = None
+        self._settings_plate_img = None
+        self._settings_hair = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        # 先销毁弹窗再重建背景：弹窗还在就会被抓进底图。
+        # 这样关闭后主窗口的画面与滑块的最终值一定一致。
+        try:
+            self.rebuild_background()
+            self._refresh_buttons_style()
+        except Exception:
+            pass
 
     # ---------------- 玻璃对话框 ----------------
     # ---------------- 说明 ----------------
@@ -1030,8 +1717,21 @@ def selftest():
         p(f"EmptyWorkingSet 自测: {'成功' if ok else '失败'}  "
           f"自身工作集 {before[1]/1048576:.1f} MB -> {after[1]/1048576:.1f} MB")
 
-    good, st = purge_standby_list()
-    p(f"清理待机内存: {'成功' if good else '失败'} (状态码 {st})")
+    # 特权自检：这一步是"清理待机内存"成功的前提
+    priv = enable_privilege("SeProfileSingleProcessPrivilege")
+    p(f"SeProfileSingleProcessPrivilege 启用: {'成功' if priv else '失败'}")
+
+    good, st, reason = purge_standby_list()
+    p(f"清理待机内存: {'成功' if good else '失败'} "
+      f"(状态码 0x{st & 0xFFFFFFFF:08X} / 原因 {reason} / "
+      f"{purge_reason_text(reason, st)})")
+
+    # 设置持久化自检
+    p(f"设置文件: {SETTINGS_PATH}")
+    p(f"设置内容: {load_settings()}")
+    p(f"透明度映射: 100→{GlassEngine.opacity_to_veil(100):.2f} / "
+      f"74→{GlassEngine.opacity_to_veil(74):.2f} / "
+      f"0→{GlassEngine.opacity_to_veil(0):.2f}")
 
     # GUI 初始化检查
     try:
@@ -1042,6 +1742,17 @@ def selftest():
         r.update()
         p(f"GUI 初始化: 成功  列表 {len(app.table.get_children())} 行")
         p(f"窗口尺寸: {app.win_w}x{app.win_h}  背景图: {app.bg_photo is not None}")
+        bg = app._bg_img
+        p(f"背景图尺寸: {bg.size if bg is not None else None}")
+        p(f"控件: 按钮 {len(app._all_buttons())} 个 / "
+          f"标题栏图标 4 个 / 表格行 {len(app.table.rows)} / "
+          f"日志行 {len(app.logview.lines)}")
+        p(f"玻璃系数: VEIL={app.engine.VEIL:.4f} glass_k={app.engine.glass_k:.3f}")
+        p(f"弹窗方法: glass_plate={'有' if callable(getattr(app, 'glass_plate', None)) else '缺失'} "
+          f"show_about={'有' if callable(getattr(app, 'show_about', None)) else '缺失'} "
+          f"info={'有' if callable(getattr(app, 'info', None)) else '缺失'} "
+          f"ask={'有' if callable(getattr(app, 'ask', None)) else '缺失'} "
+          f"show_settings={'有' if callable(getattr(app, 'show_settings', None)) else '缺失'}")
         r.destroy()
     except Exception as e:
         import traceback
@@ -1063,12 +1774,21 @@ def selftest():
         pass
 
 
-def screenshot_mode(out_path):
-    """把界面渲染出来并截图，用于开发者核对布局（普通用户用不到）。"""
+def screenshot_mode(out_path, opacity=None):
+    """把界面渲染出来并截图，用于开发者核对布局（普通用户用不到）。
+
+    Args:
+        out_path: 截图保存路径。
+        opacity: 可选，指定玻璃透明度（0~100）。不传则用设置文件里的值。
+            调界面时用不同值各出一张，比对层次是否正常。
+    """
     root = tk.Tk()
     app = MemTidyApp(root, shot=True)
+    if opacity is not None:
+        app._apply_opacity(opacity, persist=False)
     root.attributes("-topmost", True)
     app.rebuild_background()
+    app._refresh_buttons_style()
     root.update_idletasks()
     for _ in range(60):
         root.update()
@@ -1108,7 +1828,15 @@ def main():
     if "--shot" in sys.argv:
         i = sys.argv.index("--shot")
         out = sys.argv[i + 1] if len(sys.argv) > i + 1 else "shot.png"
-        screenshot_mode(out)
+        opacity = None
+        if "--opacity" in sys.argv:
+            j = sys.argv.index("--opacity")
+            if len(sys.argv) > j + 1:
+                try:
+                    opacity = int(float(sys.argv[j + 1]))
+                except ValueError:
+                    opacity = None
+        screenshot_mode(out, opacity)
         return
 
     root = tk.Tk()

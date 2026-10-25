@@ -20,6 +20,7 @@
 """
 
 import tkinter as tk
+from tkinter import font as tkfont
 
 from .compat import HAVE_PIL, Image, ImageFilter, ImageTk
 from .engine import GlassEngine
@@ -37,7 +38,17 @@ class GlassWindow:
     CAPTURE_SAFE = True       # 抓屏时排除自身（Win10 2004+）
 
     # -------------------------------------------------------------- 生命周期
-    def __init__(self, root, shot=False, title=None):
+    def __init__(self, root, shot=False, title=None, glass_opacity=None):
+        """初始化窗口。
+
+        Args:
+            root: `tk.Tk()` 实例。
+            shot: 截图/自检模式。True 时不改任务栏样式，避免干扰截图。
+            title: 窗口标题，默认用类属性 `TITLE`。
+            glass_opacity: 玻璃透明度 0~100（用户语义，100 最通透）。
+                必须在 `build_ui()` 之前生效 —— 按钮底面的 alpha 是烘进
+                贴图的，晚一步设就会拿到出厂贴图。
+        """
         self.root = root
         self.shot = shot
         self.title = self.TITLE if title is None else title
@@ -45,6 +56,8 @@ class GlassWindow:
         self.engine = GlassEngine()
         self.engine.CARD_R = R_CARD
         self.engine.WIN_R = R_WIN
+        if glass_opacity is not None:
+            self.engine.set_opacity(glass_opacity)
 
         self.win_w, self.win_h = self.WIN_W, self.WIN_H
         self.bg_photo = None
@@ -237,6 +250,22 @@ class GlassWindow:
             pass
 
     # ------------------------------------------------------------ 弹窗
+    @staticmethod
+    def button_width(text, minimum=88, pad_x=16):
+        """按文字实测宽度算弹窗按钮宽度。
+
+        固定 88px 时，「以管理员重启」这类 6 字文案实测字宽 78px，左右各只剩
+        5px，挤得几乎贴边（QA 截图 `03_purge_need_admin.png` 就是这么暴露的）。
+        这里量一次字宽再补左右内边距；短文案（「确定」「知道了」）仍然走
+        `minimum`，观感不变。
+        """
+        try:
+            f = tkfont.Font(family=FONT_UI, size=10, weight="bold")
+            tw = f.measure(str(text))
+        except Exception:
+            tw = 0
+        return int(max(minimum, tw + pad_x * 2))
+
     def glass_plate(self, w, h, dark=0.44, radius=20):
         """弹窗底板：复用主窗口已合成的背景，保证色调完全一致。
 
@@ -254,6 +283,10 @@ class GlassWindow:
                 img = self.engine._synthetic(w, h)
         img = img.convert("RGB").filter(ImageFilter.GaussianBlur(20))
         veil = Image.new("RGB", (w, h), (10, 12, 18))
+        # 弹窗底板的暗度跟着玻璃强度走一点点：主界面调得很通透时，
+        # 弹窗若还压那么黑会像另一个程序的窗口。出厂系数下乘 1，逐像素不变。
+        k = self.engine.glass_k
+        dark = max(0.0, min(0.92, float(dark) * (0.80 + 0.20 * k)))
         out = Image.blend(img, veil, dark).convert("RGBA")
         return self.engine.dialog_plate(out, radius)
 
@@ -311,24 +344,27 @@ class GlassWindow:
             result["ok"] = True
             win.destroy()
 
-        bw, bh = 88, 34
-        bx = dw - pad - bw
+        bh = 34
         by = dh - bh - 16
-        btns = [GlassButton(self, ok_text, _ok, bx, by, bw, bh, "primary",
+        bw_ok = self.button_width(ok_text)
+        bx = dw - pad - bw_ok
+        btns = [GlassButton(self, ok_text, _ok, bx, by, bw_ok, bh, "primary",
                             parent=cv)]
         if cancel_text:
-            cx = bx - bw - 10
-            btns.append(GlassButton(self, cancel_text, win.destroy, cx, by,
-                                    bw, bh, "ghost", parent=cv))
+            bw_cancel = self.button_width(cancel_text)
+            btns.append(GlassButton(self, cancel_text, win.destroy,
+                                    bx - bw_cancel - 10, by, bw_cancel, bh,
+                                    "ghost", parent=cv))
 
         for b in btns:
-            b.cv.place(x=b.x, y=b.y, width=bw, height=bh)
+            # 两个按钮宽度现在可能不同，place 和切片都必须用各自的 w/h
+            b.cv.place(x=b.x, y=b.y, width=b.w, height=b.h)
             # 弹窗按钮也得铺背景切片，否则胶囊四角会露出子 Canvas 的深色底，
             # 在浅色底板上就是一个黑方块（主窗口里由 glass_slices 负责这件事）
             if plate is not None:
                 b.set_background(
                     plate.crop((int(b.x), int(b.y),
-                                int(b.x) + bw, int(b.y) + bh)).convert("RGB"))
+                                int(b.x) + b.w, int(b.y) + b.h)).convert("RGB"))
 
         win.deiconify()
         win.attributes("-topmost", True)

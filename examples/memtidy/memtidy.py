@@ -18,10 +18,14 @@ PageOtherTest.MemoryOptimize 被替换为空实现（提示"开源内容中不�
 署名仅为遵循 PCL 仓库使用指南的要求。
 ---------------------------------------------------------------------------
 
-技术实现（三条，全部是 Windows 原生接口）：
+技术实现（五条，全部是 Windows 原生接口）：
   1. EmptyWorkingSet   —— 把进程工作集里的物理页移出（转为可回收状态）
   2. NtSetSystemInformation(MemoryPurgeStandbyList) —— 清空待机内存列表（需管理员）
-  3. TerminateProcess  —— 结束用户手动选中的后台进程（真正的内存释放）
+  3. NtSetSystemInformation(MemoryFlushModifiedList)—— 把脏页写回并释放（需管理员）
+  4. NtSetSystemInformation(SystemCombinePhysicalMemoryInformation)
+                       —— 合并各进程重复的物理页（Win10 1607+，需管理员；
+                          Win11 24H2 起系统已移除该调用，自动降级跳过）
+  5. TerminateProcess  —— 结束用户手动选中的后台进程（真正的内存释放）
 
 ------------------------------ 界面实现说明 -------------------------------
 界面部分全部来自 glass-ui（本仓库的 glass_ui 包）：tkinter 没有模糊和
@@ -56,7 +60,7 @@ from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
 from glass_ui.win import apply_round_region, make_taskbar_window
 
 APP_NAME = "内存整理器"
-APP_VER = "2.3"
+APP_VER = "2.4"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -235,6 +239,20 @@ class MEMORYSTATUSEX(ctypes.Structure):
         ("ullTotalVirtual", ctypes.c_ulonglong),
         ("ullAvailVirtual", ctypes.c_ulonglong),
         ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+class SYSTEM_COMBINE_PHYSICAL_MEMORY_INFORMATION(ctypes.Structure):
+    """NtSetSystemInformation(SystemCombinePhysicalMemoryInformation) 的参数。
+
+    x64 上恰好 16 字节（指针 + size_t）。LastApplicableProcessHandle 传
+    None 表示"对所有进程生效"；NumberOfBytesToCombine 的语义是"每个进程
+    允许合并的字节上限"——传一个足够大的值让内核自己按收益决定合并多少。
+    """
+
+    _fields_ = [
+        ("LastApplicableProcessHandle", ctypes.c_void_p),
+        ("NumberOfBytesToCombine", ctypes.c_size_t),
     ]
 
 
@@ -499,6 +517,124 @@ def purge_standby_list():
     if not priv_on:
         return False, status, "no_privilege"
     return False, status, "system"
+
+
+def flush_modified_list():
+    """把「已修改」脏页强制写回页面文件并释放为空闲内存。
+
+    工作集修剪只是把页挪到待机/已修改列表，并没有真正腾出物理内存：
+    已修改列表里的页是"脏"的，必须先写到页面文件才能变成空闲页。这个
+    调用（MemoryFlushModifiedList，类号 3）让内核立刻做这件事，相当于
+    手动触发一次页写回风暴。与 purge_standby_list 完全同构，特权要求也
+    一样（SeProfileSingleProcessPrivilege），踩过的坑见那边的注释。
+
+    Returns:
+        (ok, status, reason)
+            ok     : 布尔，系统调用是否返回 STATUS_SUCCESS。
+            status : NTSTATUS 原始值（成功时为 0）。
+            reason : 失败原因分类，取值
+                     "ok" / "no_admin" / "no_privilege" / "system"。
+    """
+    priv_on = enable_privilege("SeProfileSingleProcessPrivilege")
+
+    cmd = ctypes.c_int(3)  # MemoryFlushModifiedList（待机清理用的是 4）
+    status = int(ntdll.NtSetSystemInformation(
+        80, ctypes.byref(cmd), ctypes.sizeof(cmd)))
+
+    if status == 0:
+        return True, 0, "ok"
+    if not is_admin():
+        return False, status, "no_admin"
+    if not priv_on:
+        return False, status, "no_privilege"
+    return False, status, "system"
+
+
+# 较新的 Windows（Win11 24H2 起）把页面合并所在的一整段系统信息类号移除了，
+# 调用会拿到 STATUS_INVALID_INFO_CLASS —— 必须识别它并温和降级，而不是
+# 当成一般性失败去报错。
+STATUS_INVALID_INFO_CLASS = 0xC0000003
+
+
+def combine_memory_pages():
+    """合并各进程内容相同的物理页（内存去重，Win10 1607+ 原生能力）。
+
+    浏览器、Electron 应用、多实例进程里存在海量的重复物理页（同一个
+    DLL、同一份资源各占一份）。该调用让内核把这些页合并成一份写时复制
+    页，是系统级"白捡"内存，且不牺牲任何进程的正确性——任一进程写入时
+    内核会自动拆回私有页。
+
+    两个特殊点：
+      1. Win11 24H2 起系统已移除该系统信息类号，返回 0xC0000003
+         （STATUS_INVALID_INFO_CLASS）。这不是"失败"而是"不支持"，
+         用独立的 reason="unsupported" 分类让上层温和跳过。
+      2. NumberOfBytesToCombine 先传一个极大值（语义是"每进程合并上限"，
+         内核自行按收益决定实际合并多少）；若失败再降级尝试"物理内存
+         总字节数"，仍失败才按一般错误处理。
+
+    Returns:
+        (ok, status, reason)
+            ok     : 布尔，系统调用是否返回 STATUS_SUCCESS。
+            status : 最后一次系统调用的 NTSTATUS（成功时为 0）。
+            reason : 失败原因分类，取值
+                     "ok" / "no_admin" / "no_privilege" /
+                     "unsupported"（此 Windows 版本不支持页面合并）/
+                     "system"。
+    """
+    priv_on = enable_privilege("SeProfileSingleProcessPrivilege")
+
+    info = SYSTEM_COMBINE_PHYSICAL_MEMORY_INFORMATION()
+    info.LastApplicableProcessHandle = None
+    # 0x0000FFFFFFFFFFFF：远大于任何单进程的地址空间，语义是"不设实际上限"
+    info.NumberOfBytesToCombine = 0x0000FFFFFFFFFFFF
+    status = int(ntdll.NtSetSystemInformation(
+        147, ctypes.byref(info), ctypes.sizeof(info)))  # SystemCombinePhysicalMemoryInformation
+
+    if status == 0:
+        return True, 0, "ok"
+
+    # 24H2+ 已移除该调用：降级路径没有必要再试，直接温和跳过
+    if status & 0xFFFFFFFF == STATUS_INVALID_INFO_CLASS:
+        return False, status, "unsupported"
+
+    # 降级尝试：上限换成物理内存总字节数。个别老版本对超大上限直接拒绝。
+    ms = MEMORYSTATUSEX()
+    ms.dwLength = ctypes.sizeof(ms)
+    if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)) and ms.ullTotalPhys:
+        info2 = SYSTEM_COMBINE_PHYSICAL_MEMORY_INFORMATION()
+        info2.LastApplicableProcessHandle = None
+        info2.NumberOfBytesToCombine = ms.ullTotalPhys
+        status = int(ntdll.NtSetSystemInformation(
+            147, ctypes.byref(info2), ctypes.sizeof(info2)))
+        if status == 0:
+            return True, 0, "ok"
+
+    if not is_admin():
+        return False, status, "no_admin"
+    if not priv_on:
+        return False, status, "no_privilege"
+    return False, status, "system"
+
+
+def sysop_reason_text(reason, status, action="系统内存操作"):
+    """flush_modified_list / combine_memory_pages 共用的失败原因翻译。
+
+    与 purge_reason_text 保持文案一致（两条路径报错口径不同会让用户以为
+    是两个不同的问题），额外多一个 "unsupported" 分类。旧函数原样保留，
+    避免动到 do_purge_standby 等既有调用点。
+    """
+    if reason == "no_admin":
+        return "需要管理员权限"
+    if reason == "no_privilege":
+        return ("无法启用 SeProfileSingleProcessPrivilege"
+                "（可能被组策略限制）")
+    if reason == "unsupported":
+        return "此 Windows 版本不支持该操作"
+    if reason == "system":
+        return "系统调用返回 0x%08X" % (int(status) & 0xFFFFFFFF)
+    if reason == "ok":
+        return "成功"
+    return "未知原因"
 
 
 def purge_reason_text(reason, status):
@@ -1164,46 +1300,91 @@ class MemTidyApp(GlassWindow):
     def _optimize_worker(self):
         t0 = time.time()
         before = self.refresh_memory_silent()
-        self.log("开始内存整理 …")
+        self.log("开始深度内存整理 …")
         self.log(f"整理前：可用 {before['avail_mb']/1024:.2f} GB，"
                  f"使用率 {before['percent']:.1f}%", "dim")
 
         pids = enum_pids()
         total = len(pids)
-        ok = fail = 0
+
+        # ---- 第 1 步：第 1 轮工作集修剪（带进度条，逻辑与旧版一致）----
+        ok1 = fail = 0
         done = 0
         last_ui = 0.0
-
         for pid in pids:
             if pid == 0:
                 continue
             if empty_working_set(pid):
-                ok += 1
+                ok1 += 1
             else:
                 fail += 1
             done += 1
             now = time.time()
             if now - last_ui > 0.06:
                 last_ui = now
-                pct = done * 100.0 / max(1, total)
-                self._ui_progress(pct)
-
+                self._ui_progress(done * 100.0 / max(1, total))
         self._ui_progress(100.0)
-        self.log(f"工作集清空完成：成功 {ok} 个，失败 {fail} 个（失败通常是权限不足）")
+        self.log(f"工作集清空（第 1 轮）：成功 {ok1} 个，失败 {fail} 个"
+                 f"（失败通常是权限不足）")
 
+        # ---- 第 2 步：清待机列表 ----
+        # 注意措辞：待机清理是把 standby 缓存清成 free，"可用"计数不一定涨
+        # （缓存本来就算部分可用），所以这里不承诺"可用增加"，只说做了什么。
         if self.var_purge.get():
             self.log("正在清理待机内存列表 …", "dim")
             good, st, reason = purge_standby_list()
             if good:
-                self.log("待机内存列表已清空。", "ok")
+                self.log("待机列表已清空（该操作主要释放系统文件缓存，"
+                         "可用数值未必变化）。", "ok")
             else:
                 # 三种失败原因必须分开说，否则用户只会看到"失败"两个字，
                 # 不知道是自己没提权、还是特权被组策略摘掉了
                 self.log(f"待机内存清理失败：{purge_reason_text(reason, st)}",
                          "warn")
                 if reason == "no_admin":
-                    self.log("整理流程不会自行提权：需要时请右键「以管理员身份运行」"
-                             "后再点「清理待机内存」。", "dim")
+                    self.log("整理流程不会自行提权：需要时请右键"
+                             "「以管理员身份运行」后再试。", "dim")
+
+        # 每个系统级步骤之间都取一次快照，用于算"这一步净增了多少可用内存"
+        snap = get_memory_status()
+
+        # ---- 第 3 步：已修改页写回并释放 ----
+        good, st, reason = flush_modified_list()
+        if good:
+            now = get_memory_status()
+            self.log(f"已修改页已写回并释放："
+                     f"可用 {now['avail_mb'] - snap['avail_mb']:+.0f} MB", "ok")
+            snap = now
+        else:
+            self.log(f"已修改页写回失败：{sysop_reason_text(reason, st, '已修改页写回')}",
+                     "warn")
+            if reason == "no_admin":
+                self.log("此操作需要管理员权限，已跳过，不影响后续步骤。", "dim")
+
+        # ---- 第 4 步：合并重复物理页 ----
+        good, st, reason = combine_memory_pages()
+        if good:
+            now = get_memory_status()
+            self.log(f"内存页合并完成："
+                     f"可用 {now['avail_mb'] - snap['avail_mb']:+.0f} MB", "ok")
+            snap = now
+        elif reason == "unsupported":
+            # 不支持是正常现象（Win11 24H2+），温和提示即可，不算失败
+            self.log("此 Windows 版本未提供页面合并接口，跳过。", "dim")
+        else:
+            self.log(f"内存页合并失败：{sysop_reason_text(reason, st, '内存页合并')}",
+                     "warn")
+            if reason == "no_admin":
+                self.log("此操作需要管理员权限，已跳过，不影响后续步骤。", "dim")
+
+        # ---- 第 5 步：第 2 轮工作集修剪（无进度条，快速再收割一次）----
+        # 修剪后进程陆续把页拉回工作集，隔一轮系统操作再扫一遍能抢回一部分；
+        # 这也是为什么它放在合并之后而不是之前。
+        ok2 = 0
+        for pid in pids:
+            if pid and empty_working_set(pid):
+                ok2 += 1
+        self.log(f"工作集清空（第 2 轮）：再处理 {ok2} 个进程", "dim")
 
         time.sleep(0.8)
         after = self.refresh_memory_silent()
@@ -1216,6 +1397,31 @@ class MemTidyApp(GlassWindow):
         msg = (f"物理内存占用 {used_before/1024:.2f} GB → {used_after/1024:.2f} GB，"
                f"可用增加 {gain:+.0f} MB，耗时 {time.time()-t0:.1f} 秒")
         self.log(msg, "ok" if gain > 0 else "warn")
+
+        # ---- 智能提示：整理之外，用户还能做什么 ----
+        # 找出当前仍是"可结束"档（tier==0）且工作集 > 150 MB 的前 3 名。
+        # query_process / kill_tier 都是纯 ctypes + 全局表，线程里调用安全。
+        try:
+            big = []
+            for pid in enum_pids():
+                if not pid:
+                    continue
+                r = query_process(pid)
+                if not r:
+                    continue
+                name, ws = r
+                if kill_tier(name, pid) != 0:
+                    continue
+                mb = ws / 1048576.0
+                if mb > 150:
+                    big.append((mb, name))
+            if big:
+                big.sort(reverse=True)
+                names = "、".join(f"{n}（占用 {m:.0f} MB）" for m, n in big[:3])
+                self.log(f"提示：结束 {names} 等进程可释放更多内存，"
+                         "请在列表中选中后点「结束选中进程」。", "dim")
+        except Exception:
+            pass  # 提示是锦上添花，任何异常都不能影响按钮恢复
 
         def _finish():
             self.busy = False
@@ -1894,6 +2100,24 @@ def selftest():
     p(f"清理待机内存: {'成功' if good else '失败'} "
       f"(状态码 0x{st & 0xFFFFFFFF:08X} / 原因 {reason} / "
       f"{purge_reason_text(reason, st)})")
+
+    # ---- v2.4 新增系统操作自检 ----
+    # 只验证函数存在、可调用、返回 3 元组且 reason 在合法集合里；
+    # 不实际调用系统 API 的成功路径。普通权限下它们会返回
+    # (False, status, "no_admin")，这也是合法的降级路径，不算失败。
+    _sysop_reasons = frozenset(
+        {"ok", "no_admin", "no_privilege", "unsupported", "system"})
+    for _fn, _label in ((flush_modified_list, "已修改页写回"),
+                        (combine_memory_pages, "内存页合并")):
+        try:
+            _g, _s, _r = _fn()
+            _legal = (isinstance(_g, bool) and isinstance(_s, int)
+                      and _r in _sysop_reasons)
+            p(f"{_label}: {'通过' if _legal else '结构异常'} "
+              f"(ok={_g} / 状态码 0x{_s & 0xFFFFFFFF:08X} / 原因 {_r} / "
+              f"{sysop_reason_text(_r, _s)})")
+        except Exception as e:
+            p(f"{_label}: 异常 {e!r}")
 
     # 设置持久化自检
     p(f"设置文件: {SETTINGS_PATH}")

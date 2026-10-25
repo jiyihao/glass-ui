@@ -16,6 +16,17 @@ Canvas 上就只剩下文字和交互图元，重绘开销极低。
 
 透出来的确实是真实桌面内容，不是渐变模拟出来的。
 
+## 透明度缩放的三件套（"锚点法"）
+
+用户侧的透明度滑块映射为面纱系数 VEIL（0.18 ~ 0.96），但只缩放面纱
+是不够的 —— 光斑强度（`glow_k` → `_glow` 的 strength）和提饱和幅度
+（compose 里 `Color.enhance(1.0 + 1.05 * glow_k())`）都必须跟着淡出，
+否则最透明端叠出来的是一块浓郁的蓝紫青渐变"调色板"，玻璃特征反而
+最不明显。缩放规则：veil ≥ 0.74（出厂端）所有系数恒为出厂值，逐像素
+不变；veil 越小光斑/饱和度越弱，下限 0.35 保底（全去掉会死白得像
+亚克力板而不是玻璃）。`glass_k`（卡片/描边/按钮 alpha）是另一个方向
+的缩放，互不影响。
+
 ## 关于 alpha 的坑
 
 `ImageDraw` 在 RGBA 图上**不混合 alpha，只是直接写像素**。
@@ -35,7 +46,10 @@ class GlassEngine:
     BLUR = 30            # 高斯模糊半径。太小像磨砂贴膜，太大看不出桌面
     VEIL = 0.74          # 深色面纱强度。越低越透、文字越难读
     VEIL_DEFAULT = 0.74  # 出厂值，`glass_k` 用它做归一化；改它等于改整条基线
-    VEIL_MIN = 0.42      # 透明度 100% 时的面纱强度
+    VEIL_MIN = 0.18      # 透明度 100% 时的面纱强度。历史上是 0.42，但光斑、
+                         # 饱和度不随之缩放，导致最透明端反而像一块浓郁的
+                         # 蓝紫青渐变"调色板"——0.18 配合 glow_k() 才是真正
+                         # 能看清桌面内容的通透玻璃
     VEIL_MAX = 0.96      # 透明度 0% 时的面纱强度
     OPACITY_DEFAULT = 74 # 用户侧的默认透明度（百分比），与 VEIL_DEFAULT 对应
     CARD_R = R_CARD
@@ -66,7 +80,7 @@ class GlassEngine:
         ========  ==========  ==============================
         0         0.96        磨砂感最强
         74        0.74        出厂值，与本库硬编码的历史值一致
-        100       0.42        最通透，能看清后方桌面
+        100       0.18        最通透，能看清后方桌面
         ========  ==========  ==============================
         """
         try:
@@ -117,6 +131,28 @@ class GlassEngine:
             return 1.0
         return max(0.35, min(1.75, k))
 
+    def glow_k(self):
+        """彩色光斑/饱和度的强度系数：只在通透端减弱，磨砂端恒为 1。
+
+        与 glass_k 同理的"恒定量不随透明度缩放"问题：四角彩色光斑和
+        提饱和都是写死的，面纱越薄底图越透，这两样叠上去的"油彩感"
+        越重 —— 用户调到 100% 看到的不是清透玻璃，而是一块浓郁的
+        蓝紫青渐变调色板。所以让它们跟着面纱一起淡出：
+
+            veil = 0.18（透明度 100%）→ 0.35   光斑饱和度剩三成半
+            veil >= 0.74（≤出厂透明度）→ 1.0    出厂端逐像素不变
+
+        返回值下限 0.35 而不是 0：完全去掉光斑会显得死白，留一点
+        色散感才像"玻璃"而不是"亚克力板"。
+        """
+        try:
+            span = float(self.VEIL_DEFAULT) - float(self.VEIL_MIN)
+            t = (float(self.VEIL) - float(self.VEIL_MIN)) / max(1e-6, span)
+        except (TypeError, ValueError):
+            return 1.0
+        t = max(0.0, min(1.0, t))
+        return 0.35 + 0.65 * t
+
     # ------------------------------------------------------------------ 抓屏
     def grab(self, x, y, w, h):
         """抓取屏幕区域作为底图来源。失败返回 None（compose 会用合成底图兜底）。"""
@@ -153,12 +189,14 @@ class GlassEngine:
             base = self._synthetic(w, h)
 
         img = base.filter(ImageFilter.GaussianBlur(self.BLUR))
-        img = ImageEnhance.Color(img).enhance(2.05)      # 提饱和，液体色散感
+        # 提饱和的幅度跟着 glow_k 走：74% 时恰为 1.0 + 1.05 = 2.05，与
+        # 旧版逐像素一致；越通透加得越少，否则薄面纱 + 高饱和 = 油彩感
+        img = ImageEnhance.Color(img).enhance(1.0 + 1.05 * self.glow_k())
         img = ImageEnhance.Brightness(img).enhance(0.96)
 
         veil = Image.new("RGB", (w, h), (13, 15, 23))
         img = Image.blend(img, veil, max(0.0, min(1.0, float(self.VEIL))))
-        img = self._glow(img)
+        img = self._glow(img, self.glow_k())
         img = self._sheen(img)
         img = self._noise(img)
 
@@ -188,8 +226,13 @@ class GlassEngine:
 
     # ---------------------------------------------------------- 彩色氛围光
     @staticmethod
-    def _glow(img):
-        """四个角的彩色光斑，screen 混合上去 —— 玻璃边缘的色散感来自这里。"""
+    def _glow(img, strength=1.0):
+        """四个角的彩色光斑，screen 混合上去 —— 玻璃边缘的色散感来自这里。
+
+        strength 由 compose 按 glow_k() 传入：面纱越薄光斑越弱（亮度
+        整体缩放即可，等效于光斑减弱），否则最透明端会叠出一块浓郁的
+        彩色调色板。保留默认值 1.0 兼容潜在外部直接调用。
+        """
         w, h = img.size
         layer = Image.new("RGB", (w, h), (0, 0, 0))
         d = ImageDraw.Draw(layer)
@@ -204,7 +247,7 @@ class GlassEngine:
             rx, ry = int(w * 0.44), int(h * 0.36)
             d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=col)
         layer = layer.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.20)))
-        layer = ImageEnhance.Brightness(layer).enhance(0.52)
+        layer = ImageEnhance.Brightness(layer).enhance(0.52 * strength)
         return ImageChops.screen(img, layer)
 
     # ------------------------------------------------------------ 顶部镜面

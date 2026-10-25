@@ -200,16 +200,48 @@ y_small = base - drop + f_small.metrics("descent")
 
 **症状**：`overrideredirect(True)` 之后窗口从任务栏消失了。
 
-**解法**：补 `WS_EX_APPWINDOW`、去掉 `WS_EX_TOOLWINDOW`：
+**根因**：Tk 建一个无边框顶层窗口时，会把扩展样式写成 `WS_EX_TOOLWINDOW`。
+带这个标志的窗口在 Windows 眼里是"工具窗口"，系统不给它建任务栏按钮、
+也不放进 Alt+Tab 列表。
+
+**解法**：补 `WS_EX_APPWINDOW`、去掉 `WS_EX_TOOLWINDOW`，
+再用 `SWP_FRAMECHANGED` 逼系统重算窗口框架：
 
 ```python
-hwnd = get_hwnd(root)     # winfo_id() 是子窗口，要用 GetAncestor(h, GA_ROOT)
+hwnd = user32.GetAncestor(widget.winfo_id(), GA_ROOT)   # winfo_id() 是子窗口
 st = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                      (st | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW)
+st = (st | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+user32.SetWindowLongW(hwnd, GWL_EXSTYLE, st)
+user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER
+                    | SWP_NOACTIVATE | SWP_FRAMECHANGED)
 ```
 
+只改样式不调 `SetWindowPos`，样式虽然改对了，任务栏按钮依旧不出现。
+
+**为什么必须放在 `<Map>` 之后**：`overrideredirect` 改动取值时会重建顶层
+HWND，新句柄的扩展样式又回到 Tk 的默认值。所以在建窗阶段（`after_idle`
+之前）打的样式会被冲掉，必须在窗口映射后、且 `overrideredirect(True)`
+之后再打一遍。
+
+> **实测范围（别写过头）**：重建只发生在 `overrideredirect` **取值变化**的
+> 那一次（`False→True`、`True→False`）。同一个值重复调用不会重建 HWND，
+> 也不会重置扩展样式。实测记录：
+>
+> | 调用 | HWND | exstyle |
+> |---|---|---|
+> | 新建 Tk 窗口 | 0x0B111C | 0x00000004 |
+> | 第1次 `overrideredirect(True)` | 0x0E0CD2 ← 变 | 0x00000080 |
+> | 第2/3次 `overrideredirect(True)` | 0x0E0CD2 ← 未变 | 0x00000080 |
+> | `overrideredirect(False)` | 0x1B106A ← 变 | 0x00000100 |
+> | 第5/6次 `overrideredirect(True)` | 0x0F0CD2 ← 变 | 0x00000080 |
+>
+> 实际影响：只要程序里不再切 `overrideredirect`，映射后打一次样式就够；
+> 但最小化恢复、全屏切换这类会重新触发的路径，仍应在 `<Map>` 里重打一遍兜底。
+
 最小化也要先 `overrideredirect(False)` 再 `iconify()`，否则回不来。
+而 `overrideredirect(False)` 会重建 HWND、把样式冲回默认值，
+所以恢复时必须重打——这就是 `on_map` 里那次重复调用的意义。
 
 ---
 

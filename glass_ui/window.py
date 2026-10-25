@@ -159,9 +159,11 @@ class GlassWindow:
     def on_map(self, _e=None):
         if self.root.state() == "normal":
             self.root.overrideredirect(True)
-            # `overrideredirect(True)` 会把 exstyle 重设成 0x00000080
-            # （WS_EX_TOOLWINDOW），等于把 setup_window 里补的 APPWINDOW 打回去。
-            # 每次 map 都会走这里（含最小化恢复），所以必须每次补一遍。
+            # `overrideredirect` 改动取值时会重建顶层 HWND，新句柄的 exstyle
+            # 回到 Tk 默认的 0x00000080（WS_EX_TOOLWINDOW），setup_window 里
+            # 补的 APPWINDOW 就此丢失。最小化恢复走的就是 False→True 这条路，
+            # 所以每次 map 都要补一遍。
+            # 注意别写成「每调用一次都会重建」：实测同值重复调用不换句柄。
             if not self.shot:
                 make_taskbar_window(self.root)
             self.root.after(80, self.after_map_settle)

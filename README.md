@@ -16,6 +16,9 @@ tkinter 本身没有任何模糊、半透明合成能力，所以 Python 桌面�
 
 ![示例](examples/dashboard.png)
 
+> 不想写代码？[**下载 MemTidy.exe**](https://github.com/jiyihao/glass-ui/releases/latest)
+> 直接体验这个库的成品效果 —— 单文件免安装，双击就跑（Windows）。
+
 ---
 
 ## 这个库到底在做什么

@@ -632,6 +632,11 @@ class GlassTable:
     NOTE_FG_DEFAULT = "#8e96a8"
     NOTE_FG_SELECTED = "#c3cad8"
 
+    # 滚动条：thumb 画在画布右缘（w-8 至 w-2），命中区比可见宽一截，
+    # 不然 6px 的目标点起来太费劲。三种状态色：默认 / 悬停 / 拖动中。
+    SB_HIT = 16
+    SB_COLORS = {"idle": "#4d5468", "hover": "#7d879c", "drag": "#aeb8cc"}
+
     def __init__(self, app, x, y, w, h):
         self.app = app
         self.w, self.h = w, h
@@ -648,12 +653,19 @@ class GlassTable:
         self._row_imgs = {}
         self._dirty = False     # 是否已有排队的空闲重绘
 
+        # 滚动条状态。_sb_drag 记"鼠标相对 thumb 顶端的偏移"，
+        # None 表示没在拖动 —— 拖动中点击与悬停逻辑都要给它让路
+        self._sb_drag = None
+        self._sb_hover = False
+
         self.cv.bind("<MouseWheel>", self._on_wheel)
         self.cv.bind("<Button-4>", lambda e: self._scroll(-3))
         self.cv.bind("<Button-5>", lambda e: self._scroll(3))
         self.cv.bind("<Button-1>", self._on_click)
+        self.cv.bind("<B1-Motion>", self._on_drag_motion)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
         self.cv.bind("<Motion>", self._on_motion)
-        self.cv.bind("<Leave>", lambda e: self._set_hover(-1))
+        self.cv.bind("<Leave>", self._on_leave)
         self.cv.bind("<Configure>", lambda e: self.redraw())
 
     # ---------- 兼容 Treeview 的接口 ----------
@@ -769,6 +781,19 @@ class GlassTable:
     def visible_rows(self):
         return max(1, (self.h - 4) // self.ROW_H)
 
+    def _sb_geometry(self):
+        """滚动条几何：内容不超一屏时返回 None（不显示也不响应）。"""
+        total = len(self.rows)
+        n_vis = self.visible_rows()
+        if total <= n_vis:
+            return None
+        track_h = self.h - 4
+        bar_h = max(30, int(track_h * n_vis / total))
+        max_top = max(1, total - n_vis)
+        bar_y = 2 + int((track_h - bar_h) * self.top / max_top)
+        return {"track_y": 2, "track_h": track_h, "bar_y": bar_y,
+                "bar_h": bar_h, "max_top": max_top}
+
     def _on_wheel(self, e):
         self._scroll(-1 if e.delta > 0 else 1)
 
@@ -784,15 +809,22 @@ class GlassTable:
             return idx
         return -1
 
-    def _set_hover(self, i):
-        if i != self.hover_i:
-            self.hover_i = i
-            self.redraw()
-
-    def _on_motion(self, e):
-        self._set_hover(self._row_at(e.y))
-
     def _on_click(self, e):
+        # 命中滚动条：点 thumb 进入拖动，点轨道朝点击方向翻一屏。
+        # 必须赶在行选择之前分流，否则 e.x 落在行区域判定之外
+        # 直接 return，滚动条永远点不着。
+        if self.w - e.x <= self.SB_HIT:
+            g = self._sb_geometry()
+            if g is None:
+                return
+            if g["bar_y"] <= e.y <= g["bar_y"] + g["bar_h"]:
+                self._sb_drag = e.y - g["bar_y"]
+            elif e.y > g["bar_y"] + g["bar_h"]:
+                self._scroll(self.visible_rows())
+            else:
+                self._scroll(-self.visible_rows())
+            return
+        self._sb_drag = None
         idx = self._row_at(e.y)
         if idx < 0:
             return
@@ -806,6 +838,46 @@ class GlassTable:
         else:
             self.sel = {pid}
         self.redraw()
+
+    def _on_drag_motion(self, e):
+        """按住滚动条拖动：按 thumb 的位移比例换算滚动位置。"""
+        if self._sb_drag is None:
+            return
+        g = self._sb_geometry()
+        if g is None:
+            return
+        y = e.y - self._sb_drag
+        span = max(1, g["track_h"] - g["bar_h"])
+        ratio = (y - g["track_y"]) / span
+        self.top = max(0, min(g["max_top"],
+                              int(round(ratio * g["max_top"]))))
+        self.redraw()
+
+    def _on_release(self, _e=None):
+        if self._sb_drag is not None:
+            self._sb_drag = None
+            self.redraw()
+
+    def _set_hover(self, i):
+        if i != self.hover_i:
+            self.hover_i = i
+            self.redraw()
+
+    def _on_motion(self, e):
+        # 拖动中悬停高亮会跟着事件乱跳，直接让路给 B1-Motion
+        if self._sb_drag is not None:
+            return
+        want = (self.w - e.x) <= self.SB_HIT
+        if want != self._sb_hover:
+            self._sb_hover = want
+            self.redraw()
+        self._set_hover(self._row_at(e.y))
+
+    def _on_leave(self, _e=None):
+        if self._sb_hover:
+            self._sb_hover = False
+            self.redraw()
+        self._set_hover(-1)
 
     def set_background(self, pil_img):
         self._bg_photo = None if pil_img is None else ImageTk.PhotoImage(pil_img)
@@ -912,15 +984,14 @@ class GlassTable:
                     cv.create_text(x, cy, text=txt, anchor=anchor,
                                    fill=fg, font=f)
 
-        # 滚动条
-        total = len(rows)
-        if total > n_vis:
-            track_h = h - 4
-            bar_h = max(30, int(track_h * n_vis / total))
-            max_top = max(1, total - n_vis)
-            bar_y = 2 + int((track_h - bar_h) * self.top / max_top)
-            rrect(cv, w - 8, bar_y, w - 2, bar_y + bar_h, 3,
-                  fill="#7d879c", outline="")
+        # 滚动条：thumb 颜色跟随交互状态，拖动中最亮。
+        # 轨道不单独画底 —— Canvas 实色会盖住玻璃底图，留空反而干净
+        if self._sb_geometry() is not None:
+            state = ("drag" if self._sb_drag is not None
+                     else "hover" if self._sb_hover else "idle")
+            g = self._sb_geometry()
+            rrect(cv, w - 8, g["bar_y"], w - 2, g["bar_y"] + g["bar_h"], 3,
+                  fill=self.SB_COLORS[state], outline="")
 
 
 class GlassLog:

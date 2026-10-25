@@ -53,11 +53,10 @@ from glass_ui import (C_ACCENT, C_BG, C_CYAN, C_GREEN, C_ORANGE, C_RED,
                       GlassSlider, GlassTable, GlassToggle, GlassWindow,
                       IconButton, pill_grad, rrect)
 from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
-from glass_ui.win import (apply_round_region, make_taskbar_window,
-                          set_capture_affinity)
+from glass_ui.win import apply_round_region, make_taskbar_window
 
 APP_NAME = "内存整理器"
-APP_VER = "2.2"
+APP_VER = "2.3"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -563,6 +562,40 @@ def is_protected(name):
     return name.lower() in PROTECTED
 
 
+def kill_tier(name, pid):
+    """给进程分"能不能结束"的三档，排序和备注都靠它。
+
+    名单优先于实测：explorer.exe 这类当前用户可打开终止句柄、
+    但杀掉会桌面重启的进程，必须留在保护档里。
+
+    Returns:
+        0 = 当前权限下可直接结束；1 = 拿不到终止句柄（系统服务 /
+        受保护进程，普通用户无解）；2 = 保护名单内的进程。
+    """
+    if is_protected(name):
+        return 2
+    try:
+        h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    except Exception:
+        return 1
+    if h:
+        kernel32.CloseHandle(h)
+        return 0
+    return 1
+
+
+def row_tag_note(name, tier):
+    """把档位翻成表格行的 (tag, 备注文字)。"""
+    if tier == 2:
+        return "prot", "系统关键 · 受保护"
+    if tier == 1:
+        return "locked", "受系统保护"
+    low = name.lower()
+    if low in BACKGROUND_HINTS:
+        return "bgapp", BACKGROUND_HINTS[low] + " · 可结束"
+    return "normal", ""
+
+
 # ============================================================================
 #  主应用
 # ============================================================================
@@ -581,12 +614,16 @@ class MemTidyApp(GlassWindow):
         # 业务状态先备好：super().__init__ 里会立刻调用 build_ui()
         self.busy = False
         self._pct = 0.0           # 整理进度；空闲时改存内存使用率
-        self.snapshot = []
+        self.snapshot = []        # [(name, pid, ws, tier)] 全量进程
         self.before = None
         self.txt_detail = ""
         self.txt_count = ""
         self.txt_admin = ""
         self.var_purge = tk.BooleanVar(value=True)
+        # 列表筛选：排序模式与搜索词（搜索只影响显示层，不动 snapshot）
+        self.sort_mode = "clean"
+        self._search_text = ""
+        self._search_job = None
 
         # 设置必须在 super().__init__ 之前读好：按钮底面的 alpha 是烘进贴图的，
         # build_ui() 里创建的按钮要拿到正确的玻璃强度
@@ -619,8 +656,8 @@ class MemTidyApp(GlassWindow):
 
     def _all_buttons(self):
         out = []
-        for name in ("btn_opt", "btn_standby", "btn_kill", "_btn_refresh",
-                 "_btn_clearlog"):
+        for name in ("btn_opt", "btn_standby", "btn_kill", "btn_sort",
+                 "_btn_refresh", "_btn_clearlog"):
             b = getattr(self, name, None)
             if b is not None and b not in out:
                 out.append(b)
@@ -708,10 +745,34 @@ class MemTidyApp(GlassWindow):
         self.table = GlassTable(self, tx + 1, ty + TABLE_HEAD_H,
                                 tw - 2, th - TABLE_HEAD_H - 1)
         self.table.COLS = COLS
-        # 库不认识 tag 叫什么，这里把本程序的三种 tag 映射成颜色
-        self.table.ROW_FG = {"bgapp": C_ORANGE, "prot": "#949db0"}
+        # 库不认识 tag 叫什么，这里把本程序的四档 tag 映射成颜色：
+        # bgapp 橙（可结束的后台程序）/ prot 灰（保护名单）/
+        # locked 暗灰（拿不到终止句柄的受保护进程）
+        self.table.ROW_FG = {"bgapp": C_ORANGE, "prot": "#949db0",
+                             "locked": "#8a92a6"}
         self.table.ROW_DOT = ("bgapp",)
         self.table.NOTE_FG = {"bgapp": C_ORANGE}
+
+        # 表头右侧：搜索框 + 排序循环按钮（刷新按钮在 _draw_table_head 里建）
+        self.search_var = tk.StringVar(value=self.SEARCH_HINT)
+        self.search_entry = tk.Entry(
+            self.cv, textvariable=self.search_var, bg="#1e2434",
+            fg="#6b7386", insertbackground="#eef2f9", relief="flat",
+            highlightthickness=1, highlightbackground="#3d465c",
+            highlightcolor="#2f6fdb", font=(FONT_UI, 9))
+        # Tk Entry 没有透明能力，深色实底在这里当作"输入槽"处理，
+        # 与内存卡进度条凹槽是同一套视觉语言。
+        # 高度 24 且顶到 y+6：列头文字上缘在 y+41 附近，再低就会压住
+        # "工作集 / 备注"列头（首版 26 高放到 y+10，实测盖掉了半行字）
+        self.search_entry.place(
+            x=tx + tw - 88 - 10 - 96 - 10 - 190, y=ty + 6,
+            width=190, height=24)
+        self.search_entry.bind("<FocusIn>", self._search_focus_in)
+        self.search_entry.bind("<FocusOut>", self._search_focus_out)
+        self.search_var.trace_add("write", self._on_search_changed)
+        self.btn_sort = GlassButton(self, self.SORT_MODES[0][1], self._cycle_sort,
+                                    tx + tw - 88 - 10 - 96, ty + 9, 96, 28,
+                                    "ghost")
 
         # 日志
         lx, ly, lw, lh = self.geo["log"]
@@ -996,6 +1057,14 @@ class MemTidyApp(GlassWindow):
         self.root.after(1600, self._tick_memory)
 
     # ---------------- 进程列表 ----------------
+    # 排序模式循环：可清理优先（默认）/ 按内存 / 按名称
+    SORT_MODES = (
+        ("clean", "排序：可清理"),
+        ("mem", "排序：内存"),
+        ("name", "排序：名称"),
+    )
+    SEARCH_HINT = "搜索进程名…"
+
     def refresh_processes(self):
         if self.busy:
             return
@@ -1004,25 +1073,84 @@ class MemTidyApp(GlassWindow):
         for pid in pids:
             r = query_process(pid)
             if r:
-                rows.append((r[0], pid, r[1]))
-        rows.sort(key=lambda x: x[2], reverse=True)
+                rows.append((r[0], pid, r[1], kill_tier(r[0], pid)))
         self.snapshot = rows
+        self._rebuild_table_rows()
+        self.refresh_memory()
+
+    def _rebuild_table_rows(self):
+        """按当前搜索词过滤 + 按当前模式排序后重灌表格。
+
+        snapshot 保存全部进程（含档位），搜索只影响显示层；选中项以
+        PID 记录，重灌后仍然有效。
+        """
+        query = (self._search_text or "").strip().lower()
+        rows = [r for r in self.snapshot
+                if not query or query in r[0].lower()]
+
+        if self.sort_mode == "mem":
+            rows.sort(key=lambda r: (-r[2], r[0].lower()))
+        elif self.sort_mode == "name":
+            rows.sort(key=lambda r: (r[0].lower(), r[1]))
+        else:   # clean：可结束的排前面，同档内按内存从大到小
+            rows.sort(key=lambda r: (r[3], -r[2]))
 
         self.table.delete()
-        for name, pid, ws in rows:
-            if is_protected(name):
-                tag, note = "prot", "系统关键 · 受保护"
-            elif name.lower() in BACKGROUND_HINTS:
-                tag, note = "bgapp", BACKGROUND_HINTS[name.lower()] + " · 可结束"
-            else:
-                tag, note = "normal", ""
+        for name, pid, ws, tier in rows:
+            tag, note = row_tag_note(name, tier)
             self.table.insert("", "end", iid=str(pid), tags=(tag,), values=(
                 name, pid, f"{ws/1048576:.1f} MB" if ws else "—", note))
         # 批量插完必须显式重绘一次：GlassTable.insert 只排队一次空闲重绘，
         # 不在这里落笔的话，点「刷新」之后表头写着「共 N 个进程」而表格是空的
         self.table.redraw()
-        self.txt_count = f"共 {len(rows)} 个可枚举进程"
-        self.refresh_memory()
+        n = len(self.snapshot)
+        self.txt_count = (f"匹配 {len(rows)} / 共 {n} 个进程" if query
+                          else f"共 {n} 个可枚举进程")
+        self.draw_chrome()
+
+    def _cycle_sort(self):
+        idx = next((i for i, (m, _t) in enumerate(self.SORT_MODES)
+                    if m == self.sort_mode), 0)
+        self.sort_mode, label = self.SORT_MODES[(idx + 1) % len(self.SORT_MODES)]
+        try:
+            self.btn_sort.configure(text=label)
+        except Exception:
+            pass
+        self._rebuild_table_rows()
+
+    def _on_search_changed(self, *_):
+        """搜索词变化防抖 200ms：逐键重灌几百行会卡输入。"""
+        if self._search_job is not None:
+            try:
+                self.root.after_cancel(self._search_job)
+            except Exception:
+                pass
+        try:
+            self._search_job = self.root.after(200, self._apply_search)
+        except Exception:
+            self._search_job = None
+
+    def _apply_search(self):
+        self._search_job = None
+        text = self.search_var.get()
+        self._search_text = "" if text == self.SEARCH_HINT else text
+        self._rebuild_table_rows()
+
+    def _search_focus_in(self, _e=None):
+        if self.search_var.get() == self.SEARCH_HINT:
+            self.search_var.set("")
+            try:
+                self.search_entry.configure(fg="#eef2f9")
+            except Exception:
+                pass
+
+    def _search_focus_out(self, _e=None):
+        if not self.search_var.get():
+            self.search_var.set(self.SEARCH_HINT)
+            try:
+                self.search_entry.configure(fg="#6b7386")
+            except Exception:
+                pass
 
     # ---------------- 一键整理 ----------------
     def do_optimize(self):
@@ -1118,6 +1246,55 @@ class MemTidyApp(GlassWindow):
             pass
 
     # ---------------- 清理待机 ----------------
+    def _admin_relaunch_failed(self, code):
+        """提权失败后的统一解释：日志 + 弹窗，绝不关闭主窗口。
+
+        用户点了 UAC「否」（5）、关掉 UAC（1223）、系统拒绝（0）都要说清楚
+        发生了什么 —— 以前不看返回值直接 return True，失败时窗口凭空消失。
+        """
+        if code == ERROR_CANCELLED:
+            title = "已取消提权"
+            msg = ("UAC 对话框被关掉了，提权没有执行，程序继续运行。\n\n"
+                   "需要清理待机内存时，可以右键 exe → 「以管理员身份运行」。")
+        elif code == ERROR_ACCESS_DENIED:
+            title = "提权被拒绝"
+            msg = ("系统拒绝了提权请求（错误码 5：拒绝访问）。\n\n"
+                   "通常是在 UAC 对话框里点了「否」，或当前账户不允许提权。"
+                   "可以右键 exe → 「以管理员身份运行」，或在管理员账户下运行。")
+        else:
+            title = "提权失败"
+            msg = (f"没能拉起管理员实例（ShellExecute 返回 {code}）。\n\n"
+                   "请右键 exe → 「以管理员身份运行」，再试一次。")
+        self.log(f"未能以管理员身份重启（返回 {code}），程序继续运行。", "warn")
+        self.info(title, msg)
+
+    def ask_admin_startup(self):
+        """启动时让用户选择是否以管理员身份运行（普通权限时才问）。
+
+        走 `root.after` 延迟触发：等背景合成完、界面落定后再弹，
+        弹窗底板才能取到正确的主窗口底图。
+        """
+        if self.shot or getattr(self, "busy", False):
+            return
+        if is_admin():
+            return
+        go = self.ask(
+            "选择运行模式",
+            "以管理员身份运行，才能清空待机内存，\n"
+            "也能结束更多占用内存的后台进程。\n"
+            "普通模式下「一键整理」仍可用。\n\n"
+            "是否以管理员身份重启本程序？",
+            "以管理员重启", "普通模式继续")
+        if not go:
+            self.log("以普通模式运行。「清理待机内存」需要管理员权限。", "dim")
+            return
+        ok, code = relaunch_as_admin()
+        if ok:
+            self.log("已拉起管理员实例，当前窗口即将关闭。")
+            self.close()
+            return
+        self._admin_relaunch_failed(code)
+
     def do_purge_standby(self):
         if self.busy:
             return
@@ -1139,21 +1316,7 @@ class MemTidyApp(GlassWindow):
                     self.close()
                     return
                 # 失败绝对不能关窗口 —— 否则用户看到的就是程序凭空消失
-                if code == ERROR_CANCELLED:
-                    title = "已取消提权"
-                    msg = ("UAC 对话框被关掉了，提权没有执行，程序继续运行。\n\n"
-                           "需要清理待机内存时，可以右键 exe → 「以管理员身份运行」。")
-                elif code == ERROR_ACCESS_DENIED:
-                    title = "提权被拒绝"
-                    msg = ("系统拒绝了提权请求（错误码 5：拒绝访问）。\n\n"
-                           "通常是在 UAC 对话框里点了「否」，或当前账户不允许提权。"
-                           "可以右键 exe → 「以管理员身份运行」，或在管理员账户下运行。")
-                else:
-                    title = "提权失败"
-                    msg = (f"没能拉起管理员实例（ShellExecute 返回 {code}）。\n\n"
-                           "请右键 exe → 「以管理员身份运行」，再点一次「清理待机内存」。")
-                self.log(f"未能以管理员身份重启（返回 {code}），程序继续运行。", "warn")
-                self.info(title, msg)
+                self._admin_relaunch_failed(code)
             else:
                 self.log("已取消提权。", "dim")
         else:
@@ -1181,15 +1344,19 @@ class MemTidyApp(GlassWindow):
             if len(vals) < 2:
                 continue
             name, pid = vals[0], vals[1]
+            # 名单优先，其次实测终止句柄 —— 两道检查对应表格里的
+            # 「受保护」和「受系统保护」两档灰字
             if is_protected(name):
+                blocked.append(name)
+            elif kill_tier(name, int(pid)) != 0:
                 blocked.append(name)
             else:
                 targets.append((name, pid))
 
         if blocked:
             self.info("已跳过受保护进程",
-                      "以下进程属于系统关键进程或反作弊组件，已跳过：\n\n"
-                      + "\n".join(blocked))
+                      "以下进程受系统保护，或当前账户没有结束它们的权限，"
+                      "已跳过：\n\n" + "\n".join(blocked))
         if not targets:
             return
 
@@ -1243,7 +1410,12 @@ class MemTidyApp(GlassWindow):
             self._settings_hidden = False
 
     def _restore_settings_window(self):
-        """把设置弹窗重新显示出来，并恢复顶层、圆角与抓屏排除。"""
+        """把设置弹窗重新显示出来，并恢复顶层与圆角。
+
+        不再给弹窗挂抓屏排除（WDA_EXCLUDEFROMCAPTURE）：那个标志会让弹窗
+        在 Win+Shift+S 截屏期间同样从屏幕上消失。主窗口重建背景前本来就
+        会先 withdraw 这个弹窗（见 rebuild_background），排除没有存在必要。
+        """
         win = self._settings_win
         if win is None:
             return
@@ -1251,7 +1423,6 @@ class MemTidyApp(GlassWindow):
             win.deiconify()
             win.attributes("-topmost", True)
             win.lift()
-            set_capture_affinity(win, True)
             apply_round_region(win, 22)
         except Exception:
             pass
@@ -1329,11 +1500,8 @@ class MemTidyApp(GlassWindow):
         win.deiconify()
         win.attributes("-topmost", True)
         win.lift()
-        # 主窗口重建背景时不能把弹窗一起拍进去，所以弹窗也要排除抓屏
-        try:
-            set_capture_affinity(win, True)
-        except Exception:
-            pass
+        # 不挂抓屏排除：标志会让弹窗在 Win+Shift+S 期间从屏幕上消失。
+        # 主窗口重建背景前会先 withdraw 本弹窗，不需要排除来防串影
         try:
             win.update_idletasks()
             apply_round_region(win, 22)
@@ -1765,7 +1933,36 @@ def selftest():
           f"show_about={'有' if callable(getattr(app, 'show_about', None)) else '缺失'} "
           f"info={'有' if callable(getattr(app, 'info', None)) else '缺失'} "
           f"ask={'有' if callable(getattr(app, 'ask', None)) else '缺失'} "
-          f"show_settings={'有' if callable(getattr(app, 'show_settings', None)) else '缺失'}")
+          f"show_settings={'有' if callable(getattr(app, 'show_settings', None)) else '缺失'} "
+          f"ask_admin_startup={'有' if callable(getattr(app, 'ask_admin_startup', None)) else '缺失'}")
+
+        # ---- v2.3 新功能自检 ----
+        # 抓屏排除：默认必须关着，否则 Win+Shift+S 时窗口会从屏幕上消失
+        p(f"抓屏排除(CAPTURE_SAFE): {'开（截屏会看不见窗口）' if app.CAPTURE_SAFE else '关（截屏可见）'}")
+        # 滚动条：行数超过一屏时必须给出可拖动几何
+        g = app.table._sb_geometry()
+        p(f"滚动条: {'可见 bar_y=%d bar_h=%d' % (g['bar_y'], g['bar_h']) if g else '隐藏'} "
+          f"拖动状态={app.table._sb_drag}")
+        # 搜索：模拟输入并数匹配行，测完恢复
+        try:
+            app.search_var.set("svchost")
+            app._apply_search()
+            hit = len(app.table.rows)
+            p(f"搜索过滤: 'svchost' 匹配 {hit} 行 "
+              f"(计数文字: {app.txt_count})")
+        except Exception as e:
+            p(f"搜索过滤: 异常 {e!r}")
+        finally:
+            app._search_text = ""
+            app._rebuild_table_rows()
+        # 排序：三档计数（可结束 / 受系统保护 / 名单内）
+        tiers = {0: 0, 1: 0, 2: 0}
+        for _n, _p2, _w, t in app.snapshot:
+            tiers[t] = tiers.get(t, 0) + 1
+        p(f"可结束分档: 可结束 {tiers.get(0, 0)} / 受系统保护 "
+          f"{tiers.get(1, 0)} / 名单内 {tiers.get(2, 0)}")
+        p(f"排序模式: {app.sort_mode}（按钮 {getattr(app.btn_sort, 'text', '?')}"
+          f"{'' if hasattr(app, 'btn_sort') else '缺失'}）")
         r.destroy()
     except Exception as e:
         import traceback
@@ -1854,6 +2051,9 @@ def main():
 
     root = tk.Tk()
     app = MemTidyApp(root)
+    # 启动后让用户选一次运行模式：管理员重启 or 普通模式继续。
+    # 延迟到背景合成完再弹，玻璃弹窗的底板才有正确的图可取。
+    root.after(400, app.ask_admin_startup)
     app.run()
 
 

@@ -249,9 +249,17 @@ HWND，新句柄的扩展样式又回到 Tk 的默认值。所以在建窗阶段
 
 **症状**：玻璃背景里出现了本程序自己的画面，无限套娃。
 
-**解法**：`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`（0x11），
-需要 Windows 10 2004+。截图核对界面时要临时关掉
-（`WDA_NONE`），否则截出来的是一块空白。
+**解法（v0.1.5 起的两层）**：
+
+1. **首次抓屏放在窗口映射之前**（`__init__` 里同步调 `rebuild_background()`，
+   坐标用 geometry 的请求值 —— 未映射时 `winfo_rootx()` 返回 0，见第 20 条）。
+   此时屏幕上还没有本窗口，抓到的必然是干净桌面。
+2. 显示中重抓（拖动松手、改透明度后）会把窗口自身模糊后的影像混进底色。
+   这是接受的取舍 —— 见第 21 条，排除标志的代价更糟。模糊后的自身影像
+   视觉上等同玻璃反光，且每次重抓被新影像替换（衰减）而非叠加。
+
+旧版用 `WDA_EXCLUDEFROMCAPTURE` 排除自己，v0.1.5 起默认不用了，
+原因见第 21 条。
 
 ---
 
@@ -363,6 +371,55 @@ return bool(ok) and ctypes.get_last_error() != 1300
 
 **解法**：`glass_slices()` 里一律用创建控件时**记录的确定值**（比如布局字典里的
 `(x, y, w, h)`），不要回过头去问 Tk。实在要问，也要先判 `> 1`。
+
+---
+
+## 21. `WDA_EXCLUDEFROMCAPTURE` 会让窗口在 Win+Shift+S 时消失
+
+**症状**：一切渲染正常，但用户一按 Win+Shift+S（或任何屏幕捕获会话：
+OBS、会议软件共享屏幕），整个窗口从屏幕上**凭空蒸发**，截屏结束后才回来。
+
+**根因**：`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` 的语义
+不是"截图工具截不到我"，而是**"从所有捕获会话中移除本窗口"**。Win10 2004+
+上这是在 DWM 合成树里摘掉窗口图层实现的 —— 而 Win+Shift+S 的全屏遮罩
+本身就是系统级捕获会话，遮罩弹出期间被排除的窗口对**用户自己**也不可见。
+这是文档化行为（"Everywhere else, the window does not appear at all"）。
+
+第 13 条曾经用它防抓屏递归，v0.1.5 起废弃：截屏时工具消失（用户可感知的
+缺陷）比背景里多一层自己的模糊影像（几乎不可感知）严重得多。
+
+**解法**：
+
+* 默认 `CAPTURE_SAFE = False`，重建背景时显式写回 `WDA_NONE`；
+* 首屏干净靠"映射前先抓屏"（见第 13 条）；
+* 弹窗同理 —— 别给 Toplevel 挂这个标志，主窗口重抓前先 `withdraw()` 弹窗。
+
+**验证手段**：`GetWindowDisplayAffinity` 回读必须为 `WDA_NONE(0x0)`；
+再用 `PIL.ImageGrab.grab` 抓窗口区域与 `--shot` 基准图比对像素差，
+确认系统级抓屏拿到的确实是窗口内容。
+
+---
+
+## 22. root 未映射时，嵌套子窗口收不到 `event_generate`
+
+**症状**：自动化测试里 `canvas.event_generate("<Button-1>", x=..., y=...)`
+对 place 在另一个 Canvas 上的子 Canvas（比如 `GlassTable.cv`）毫无反应，
+同样的代码绑在顶层直接子控件上却正常。
+
+**根因**：`root.withdraw()` / 尚未 map 时，Tk 的布局树没有映射，
+嵌套的非 toplevel 窗口不参与事件分发。顶层（root）的直属子控件
+走的是另一条路径，所以能收到。
+
+**解法**：发事件之前先让窗口真实映射：
+
+```python
+root.update_idletasks()
+root.update()          # 必须真正 map，withdraw 状态下嵌套子窗口收不到事件
+widget.event_generate("<Button-1>", x=..., y=...)
+```
+
+另外注意：拖动松手后 thumb 位置会随 `top` 移动，测试脚本每次点击前
+必须重取几何，不能复用上一次的坐标（否则点中的其实是移动后的轨道）。
 
 ---
 

@@ -6,7 +6,7 @@
 * 去边框、居中、屏幕太矮时自动缩高
 * 系统级圆角裁剪（SetWindowRgn）
 * 补 WS_EX_APPWINDOW，让无边框窗口仍出现在任务栏和 Alt+Tab
-* 抓屏时把自己排除（WDA_EXCLUDEFROMCAPTURE），否则背景会拍到自己的递归影像
+* 首次抓屏安排在窗口映射之前，背景里不会混进自己的影像
 * 空白处按住拖动窗口
 * 重建背景时给每个子 Canvas 切一块对应的底图（圆角外才不会露方框）
 * 配套的玻璃弹窗 ask() / info()
@@ -35,7 +35,7 @@ class GlassWindow:
     WIN_H = 744
     MIN_H = 620
     TITLE = "Glass UI"
-    CAPTURE_SAFE = True       # 抓屏时排除自身（Win10 2004+）
+    CAPTURE_SAFE = False      # 见 rebuild_background()：默认不再排除抓屏
 
     # -------------------------------------------------------------- 生命周期
     def __init__(self, root, shot=False, title=None, glass_opacity=None):
@@ -64,11 +64,16 @@ class GlassWindow:
         self._bg_img = None
         self._bg_pending = False
         self._drag = None
+        self._win_x = 0          # geometry 请求位置；窗口未映射时抓屏用
+        self._win_y = 0
 
         self.fit_screen()
         self.setup_window()
         self.build_ui()
         self.on_ready()
+        # 窗口映射前先合成一次背景：此刻抓屏拍到的是干净桌面。
+        # 等到 map 之后再抓（after(60) 那次），屏幕上已经有窗口自己了。
+        self.rebuild_background()
         self.root.after(60, self.rebuild_background)
 
     # ---- 子类要实现的钩子 ----
@@ -126,6 +131,9 @@ class GlassWindow:
         x = max(0, (r.winfo_screenwidth() - self.win_w) // 2)
         y = max(10, (r.winfo_screenheight() - 80 - self.win_h) // 2)
         r.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
+        # 窗口还没映射时 winfo_rootx() 返回 0，首次抓屏只能用 geometry 的
+        # 请求坐标，这里必须记下来
+        self._win_x, self._win_y = x, y
         r.overrideredirect(True)
         r.attributes("-topmost", False)
         if not self.shot:
@@ -145,8 +153,13 @@ class GlassWindow:
         apply_round_region(self.root, R_WIN)
 
     def set_capture_affinity(self, enable=True):
-        if self.CAPTURE_SAFE:
-            set_capture_affinity(self.root, enable)
+        """开关"抓屏时排除自己"。
+
+        默认不开（CAPTURE_SAFE=False）：排除标志会让窗口在 Win+Shift+S
+        这类捕获会话期间从屏幕上消失。需要隐藏于截屏的场景可显式开启，
+        或把类属性 CAPTURE_SAFE 改回 True 恢复旧行为。
+        """
+        set_capture_affinity(self.root, enable)
 
     def minimize(self):
         """最小化：先恢复边框再 iconify，否则无边框窗口无法进任务栏。"""
@@ -230,6 +243,19 @@ class GlassWindow:
         self._bg_pending = True
         self.root.after(delay, self.rebuild_background)
 
+    def _grab_origin(self):
+        """抓屏起点。
+
+        窗口未映射时 `winfo_rootx()` 返回 0，直接用会把屏幕左上角抓进来，
+        所以未映射阶段必须回退到 geometry 的请求坐标。
+        """
+        try:
+            if self.root.winfo_ismapped():
+                return self.root.winfo_rootx(), self.root.winfo_rooty()
+        except Exception:
+            pass
+        return getattr(self, "_win_x", 0), getattr(self, "_win_y", 0)
+
     def rebuild_background(self):
         self._bg_pending = False
         w, h = self.win_w, self.win_h
@@ -244,11 +270,24 @@ class GlassWindow:
         self.win_w, self.win_h = w, h
 
         self.apply_round_region()
-        self.set_capture_affinity(True)
+        # 抓屏排除自己 vs 捕获会话期间可见，二者只能选一个（v0.1.5 起默认可见）：
+        # WDA_EXCLUDEFROMCAPTURE 能让抓屏不拍到窗口自身，但 Win+Shift+S 的
+        # 全屏遮罩本身就是捕获会话，排除标志会让窗口在遮罩期间从屏幕上整个
+        # 消失 —— 用户一截屏工具就"凭空蒸发"。默认不再排除。代价是窗口显示
+        # 中重抓背景时，会把自身模糊后的影像混进玻璃底色，视觉上等同玻璃
+        # 反光，且每次重抓都在衰减（旧影像被新影像替换而非叠加），不会恶化。
+        # 启动首屏在映射前抓（见 __init__），完全干净。仍要排除的场景把
+        # CAPTURE_SAFE 改回 True 即可。
+        if self.CAPTURE_SAFE:
+            set_capture_affinity(self.root, True)
+        else:
+            # 显式清成 WDA_NONE：HWND 重建后新句柄默认就是 0，这一步主要是
+            # 把旧版本窗口或运行中动态切换过来的状态兜干净
+            set_capture_affinity(self.root, False)
 
         if self.engine.ok:
-            self.engine.grab(self.root.winfo_rootx(), self.root.winfo_rooty(),
-                             w, h)
+            gx, gy = self._grab_origin()
+            self.engine.grab(gx, gy, w, h)
 
         img = self.engine.compose(w, h,
                                   self.glass_cards(),

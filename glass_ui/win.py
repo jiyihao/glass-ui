@@ -7,9 +7,10 @@ tkinter 做无边框窗口有三件事必须自己接系统接口，否则会有
    能让系统层面把四角裁掉，任务栏预览和阴影也跟着变圆。
 2. 任务栏 / Alt+Tab —— `overrideredirect(True)` 的窗口默认不会出现在任务栏，
    要补上 `WS_EX_APPWINDOW` 并去掉 `WS_EX_TOOLWINDOW`。
-3. 抓自己 —— 窗口内容来自"抓取后方桌面"，抓的时候必须把自己排除在画面外，
-   否则会拍到自己形成递归。`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`
-   需要 Windows 10 2004 及以上。
+3. 抓自己 —— 窗口内容来自"抓取后方桌面"，显示中重抓会拍到窗口自身。
+   `set_capture_affinity(WDA_EXCLUDEFROMCAPTURE)` 能排除，但代价是
+   Win+Shift+S 等捕获会话期间窗口从屏幕上整个消失，所以 v0.1.5 起
+   默认不排除、改靠"映射前先抓一次"保证首屏干净。
 """
 
 import ctypes

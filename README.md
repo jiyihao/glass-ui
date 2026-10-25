@@ -163,9 +163,9 @@ Demo(root).run()
 | `IconButton` | 标题栏圆形图标按钮（最小化 / 关闭 / 帮助 / 齿轮），可指定 `glyph_font` |
 | `GlassToggle` | iOS 风格开关，轨道渐变 + 滑块投影 + 球体明暗 |
 | `GlassSlider` | 圆角轨道 + 渐变填充 + 圆形滑块头；`on_drag` 实时、`on_change` 松手 |
-| `GlassTable` | 自绘可滚动表格，行底纹是内缩圆角条；带 Treeview 的一个子集接口 |
+| `GlassTable` | 自绘可滚动表格：滚轮 + **可拖动滚动条**（thumb 拖动 / 点轨道翻页），行底纹是内缩圆角条；带 Treeview 的一个子集接口 |
 | `GlassLog` | 只读日志，时间戳等宽字体，正文按 tag 上色 |
-| `GlassWindow` | 无边框圆角窗口基类，附带 `ask()` / `info()` 玻璃弹窗 |
+| `GlassWindow` | 无边框圆角窗口基类，附带 `ask()` / `info()` 玻璃弹窗；窗口不参与屏幕捕获排除，Win+Shift+S 截屏时不会消失 |
 
 表格和日志的 tag 颜色由类属性映射，库不认识你的 tag 叫什么：
 

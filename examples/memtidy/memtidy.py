@@ -53,10 +53,11 @@ from glass_ui import (C_ACCENT, C_BG, C_CYAN, C_GREEN, C_ORANGE, C_RED,
                       GlassSlider, GlassTable, GlassToggle, GlassWindow,
                       IconButton, pill_grad, rrect)
 from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
-from glass_ui.win import apply_round_region, set_capture_affinity
+from glass_ui.win import (apply_round_region, make_taskbar_window,
+                          set_capture_affinity)
 
 APP_NAME = "内存整理器"
-APP_VER = "2.1"
+APP_VER = "2.2"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -1742,6 +1743,18 @@ def selftest():
         r.update()
         p(f"GUI 初始化: 成功  列表 {len(app.table.get_children())} 行")
         p(f"窗口尺寸: {app.win_w}x{app.win_h}  背景图: {app.bg_photo is not None}")
+        # 自检的窗口是 shot 模式：按设计不碰任务栏样式，光读会读到 Tk 默认的
+        # 0x00000080（TOOLWINDOW），看不出库这条路到底通没通。所以这里显式调
+        # 一次库函数再回读 —— withdraw 的窗口一样能读写 exstyle，值是真的。
+        installed = make_taskbar_window(r)
+        ts = app.taskbar_state()
+        if not ts["exstyle"]:
+            p("任务栏样式: 读取失败，取不到窗口句柄")
+        else:
+            p(f"任务栏样式: exstyle=0x{ts['exstyle']:08X} "
+              f"APPWINDOW={'有' if ts['appwindow'] else '无'} "
+              f"TOOLWINDOW={'有' if ts['toolwindow'] else '无'}"
+              f"{'' if installed else '（设置失败）'}")
         bg = app._bg_img
         p(f"背景图尺寸: {bg.size if bg is not None else None}")
         p(f"控件: 按钮 {len(app._all_buttons())} 个 / "

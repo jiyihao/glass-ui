@@ -26,8 +26,8 @@ from .compat import HAVE_PIL, Image, ImageFilter, ImageTk
 from .engine import GlassEngine
 from .theme import C_BG, FONT_UI, R_CARD, R_WIN
 from .widgets import GlassButton
-from .win import (apply_round_region, make_taskbar_window,
-                  set_capture_affinity)
+from .win import (WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, apply_round_region,
+                  get_exstyle, make_taskbar_window, set_capture_affinity)
 
 
 class GlassWindow:
@@ -159,8 +159,37 @@ class GlassWindow:
     def on_map(self, _e=None):
         if self.root.state() == "normal":
             self.root.overrideredirect(True)
-            self.root.after(80, self.apply_round_region)
+            # `overrideredirect(True)` 会把 exstyle 重设成 0x00000080
+            # （WS_EX_TOOLWINDOW），等于把 setup_window 里补的 APPWINDOW 打回去。
+            # 每次 map 都会走这里（含最小化恢复），所以必须每次补一遍。
+            if not self.shot:
+                make_taskbar_window(self.root)
+            self.root.after(80, self.after_map_settle)
             self.schedule_bg(200)
+
+    def after_map_settle(self):
+        """map 之后 80ms 的收尾：先补任务栏样式，再切圆角。
+
+        顺序不能反 —— `apply_round_region` 会 `SetWindowRgn` 重设整个窗口
+        region，放在 `SetWindowPos(SWP_FRAMECHANGED)` 之后才不会被框架重算
+        覆盖掉。
+        """
+        if not self.shot:
+            make_taskbar_window(self.root)
+        self.apply_round_region()
+
+    def taskbar_state(self):
+        """当前任务栏相关的扩展样式状态（诊断用）。
+
+        Returns:
+            dict: `{"exstyle": int, "appwindow": bool, "toolwindow": bool}`
+        """
+        st = get_exstyle(self.root)
+        return {
+            "exstyle": st,
+            "appwindow": bool(st & WS_EX_APPWINDOW),
+            "toolwindow": bool(st & WS_EX_TOOLWINDOW),
+        }
 
     def close(self):
         try:

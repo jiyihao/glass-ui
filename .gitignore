@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 打包
+*.spec
+
+# 运行时产物
+selftest_report.txt
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store

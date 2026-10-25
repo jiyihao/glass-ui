@@ -1,6 +1,6 @@
 # glass-ui
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](https://github.com/jiyihao/glass-ui/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d4.svg)]()
 [![Deps](https://img.shields.io/badge/Deps-Pillow%20only-8a2be2.svg)]()
@@ -14,7 +14,7 @@ tkinter 本身没有任何模糊、半透明合成能力，所以 Python 桌面�
 
 透出来的是**真实桌面内容**，不是渐变模拟。
 
-![示例](examples/dashboard.png)
+![示例](https://raw.githubusercontent.com/jiyihao/glass-ui/main/examples/dashboard.png)
 
 > 不想写代码？[**下载 MemTidy.exe**](https://github.com/jiyihao/glass-ui/releases/latest)
 > 直接体验这个库的成品效果 —— 单文件免安装，双击就跑（Windows）。
@@ -65,15 +65,19 @@ tkinter 的三个「看起来能用其实不行」的方案：
 
 ## 安装
 
-没有发布到 PyPI，两种方式：
+```bash
+pip install glass-ui
+```
+
+只依赖 Pillow。想改源码就用可编辑安装：
 
 ```bash
 git clone https://github.com/jiyihao/glass-ui.git
 cd glass-ui
-pip install -e .          # 只依赖 Pillow
+pip install -e .
 ```
 
-或者直接把 `glass_ui/` 文件夹丢进你的项目里。
+或者直接把 `glass_ui/` 文件夹丢进你的项目里，不需要装任何东西。
 
 要求：Windows（用到了 Win32 接口）、Python 3.9+、Pillow 9+。
 没有 Pillow 时库不会崩，会自动退化成纯色直角界面。
@@ -231,7 +235,7 @@ python examples/memtidy/memtidy.py
 ## 踩过的坑
 
 写这个库的过程中踩到一批 tkinter / Pillow / Win32 的坑，全部记录在
-[`docs/PITFALLS.md`](docs/PITFALLS.md)。几条高频的：
+[`docs/PITFALLS.md`](https://github.com/jiyihao/glass-ui/blob/main/docs/PITFALLS.md)。几条高频的：
 
 - **`ImageDraw` 在 RGBA 图上不混合 alpha**，只是直接写像素。半透明图元必须先画到
   独立图层再 `alpha_composite`，否则 `convert("RGB")` 之后就是一个纯白实心块。
@@ -247,4 +251,4 @@ python examples/memtidy/memtidy.py
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/jiyihao/glass-ui/blob/main/LICENSE)

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,22 +8,30 @@ version = "0.1.0"
 description = "Liquid-glass UI layer for tkinter on Windows: real desktop blur behind your window, plus fully self-drawn widgets."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "jiyihao" }]
-keywords = ["tkinter", "gui", "glass", "blur", "acrylic", "windows", "desktop"]
+keywords = [
+    "tkinter", "gui", "glass", "liquid-glass", "glassmorphism",
+    "blur", "acrylic", "mica", "windows", "desktop", "ui",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: User Interfaces",
+    "Topic :: Multimedia :: Graphics",
 ]
 dependencies = ["Pillow>=9.0"]
 
 [project.urls]
 Homepage = "https://github.com/jiyihao/glass-ui"
-Source = "https://github.com/jiyihao/glass-ui"
+Repository = "https://github.com/jiyihao/glass-ui"
+Issues = "https://github.com/jiyihao/glass-ui/issues"
+Changelog = "https://github.com/jiyihao/glass-ui/releases"
 
 [tool.setuptools]
 packages = ["glass_ui"]

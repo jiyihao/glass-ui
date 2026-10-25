@@ -1,11 +1,18 @@
 # glass-ui
 
+[![PyPI](https://img.shields.io/pypi/v/glass-ui.svg)](https://pypi.org/project/glass-ui/)
+[![Downloads](https://img.shields.io/pypi/dm/glass-ui.svg)](https://pypi.org/project/glass-ui/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](https://github.com/jiyihao/glass-ui/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d4.svg)]()
 [![Deps](https://img.shields.io/badge/Deps-Pillow%20only-8a2be2.svg)]()
 
 **给 tkinter 用的液态玻璃（Liquid Glass）界面层。**
+
+```bash
+pip install glass-ui
+```
+
 
 tkinter 本身没有任何模糊、半透明合成能力，所以 Python 桌面小工具默认长相都很朴素。
 这个库把「看起来像一块真玻璃」需要的东西都包好了：抓取窗口后方的真实桌面 → 高斯模糊

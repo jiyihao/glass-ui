@@ -60,7 +60,7 @@ from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
 from glass_ui.win import apply_round_region, make_taskbar_window
 
 APP_NAME = "内存整理器"
-APP_VER = "2.7"
+APP_VER = "2.8"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -1677,6 +1677,28 @@ class MemTidyApp(GlassWindow):
         except Exception:
             pass
 
+    def on_window_moved(self, x, y, dx, dy):
+        """主窗口被拖到新位置后，把设置弹窗一起挪过去。
+
+        弹窗是独立 Toplevel，不会跟着父窗口走（旧版拖主窗口时它就傻站在
+        原地）。它本来就是相对主窗口居中的，这里按同样的相对偏移重算一次。
+        """
+        win = self._settings_win
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists() or not win.winfo_viewable():
+                return
+        except Exception:
+            return
+        dw, dh = self._settings_size
+        px = x + max(0, (self.win_w - dw) // 2)
+        py = max(16, y + max(20, (self.win_h - dh) // 2))
+        try:
+            win.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
+
     def show_settings(self):
         """打开「界面设置」玻璃弹窗（拖动滑块调界面透明度）。
 
@@ -1857,19 +1879,27 @@ class MemTidyApp(GlassWindow):
         except Exception:
             pass
 
-    def _apply_opacity(self, percent, persist=False, rebuild=False):
+    def _apply_opacity(self, percent, persist=False, rebuild=False,
+                       preview=False):
         """把用户语义的透明度落到引擎上，返回实际生效的整数百分比。
 
         Args:
             percent: 0~100 的透明度（100 最通透）。
             persist: 是否写入 settings.json。
-            rebuild: 是否立即重建背景。拖动中一律 False —— 走防抖。
+            rebuild: 是否立即重建背景（抓屏 + 全屏模糊 + 重绘图元）。
+            preview: 是否立即出一帧预览（只重算窗口区域，约 40ms）。
+                拖动中走这个；两者都不要，就只改参数等人来重画。
         """
         pct = self.engine.set_opacity(percent)
         self.settings["glass_opacity"] = pct
         if persist:
             save_settings(self.settings)
         self._update_settings_pct(pct)
+        if preview:
+            try:
+                self.preview_opacity()
+            except Exception:
+                pass
         if rebuild:
             try:
                 self.rebuild_background()
@@ -1879,8 +1909,8 @@ class MemTidyApp(GlassWindow):
         return pct
 
     def _on_opacity_drag(self, value):
-        """拖动中：只改遮罩系数与百分比数字，不重建背景。"""
-        self._apply_opacity(float(value) * 100.0, persist=False)
+        """拖动中：即时预览。只重算窗口区域，不抓屏、不重绘图元。"""
+        self._apply_opacity(float(value) * 100.0, persist=False, preview=True)
 
     def _on_opacity_commit(self, value):
         """松手：落盘 + 120ms 防抖重建背景。"""
@@ -2198,10 +2228,38 @@ def selftest():
           f"标题栏图标 4 个 / 表格行 {len(app.table.rows)} / "
           f"日志行 {len(app.logview.lines)}")
         p(f"玻璃系数: VEIL={app.engine.VEIL:.4f} glass_k={app.engine.glass_k:.3f}")
-        # 视差链路自检：预处理大图 + 位移裁剪 + 帧合成。任何一环坏掉，表现都是
-        # "拖动时玻璃内容跟着窗口一起跑"，肉眼很难判，必须让自检盯住。
+        # 即时预览：拖滑块时走半尺寸重算 + 量化静态层。两样都是"看着没问题
+        # 其实没生效"的高危项，让自检把实际耗时和输出尺寸打出来
+        try:
+            _t = time.perf_counter()
+            _pv = app.engine.preview_frame(app.glass_cards(),
+                                          app.glass_decorators())
+            _pv_ms = (time.perf_counter() - _t) * 1000
+            _pv_ok = _pv is not None and _pv.size == (app.win_w, app.win_h)
+            _pv_size = _pv.size if _pv is not None else None
+            p(f"即时预览: {_pv_ms:.1f} ms/帧 ({1000 / max(1.0, _pv_ms):.0f} fps)"
+              f" / 输出 {_pv_size}{'' if _pv_ok else '  ← 异常'}")
+        except Exception as e:
+            p(f"即时预览: 异常 {e!r}")
+        # 拖动链路自检。两种模式要盯的东西完全不同：
+        #  · 白框模式（默认）：拖的是轮廓框，窗口在松手前一动不动，逐帧
+        #    视差用不上 —— 此时余量必须是 0，否则白烧一次全屏模糊。
+        #  · 视差模式：余量要够、frame(dx) 要真的换位置、越界要夹住。
+        #    任何一环坏掉的表现都是"拖动时玻璃内容跟着窗口一起跑"，
+        #    肉眼很难判，必须让自检盯住。
         eng = app.engine
-        if eng._prep is None:
+        if app.DRAG_OUTLINE:
+            _pad = eng.prep_pad
+            _o = app._outline_win()
+            _has = _o is not None
+            _key = bool(getattr(app, "_outline_key", False))
+            app._destroy_outline()
+            _ok = (_pad == (0, 0, 0, 0)) and _has and _key
+            p(f"拖动方式: 白框（窗口不动，松手才平移）/ 余量 {_pad} / "
+              f"轮廓框 {'可建' if _has else '建不起来'} / "
+              f"透明键色 {'支持' if _key else '不支持（退化为半透明）'}"
+              f"{'' if _ok else '  ← 异常'}")
+        elif eng._prep is None:
             p("拖动视差: 未启用（没有预处理大图）")
         else:
             _pad = eng.prep_pad

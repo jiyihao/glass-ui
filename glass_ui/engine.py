@@ -87,6 +87,12 @@ class GlassEngine:
     PAD = 220            # 视差余量下限。真正的余量由 GlassWindow 按窗口到
                          # 屏幕四边的距离算（取到能拖遍整个桌面），这里只是
                          # 直接调 prepare() 时的默认值。
+    PREVIEW_SCALE = 0.5  # 拖动透明度滑块时的预览缩放。见 `preview_frame()`：
+                         # 半尺寸等于 4 倍速度，而拖动时用户看的是"透不透"
+    PREVIEW_K_STEP = 0.1 # 预览时把 glass_k 量化到这个步进。卡片填充、描边、
+                         # 阴影的 alpha 都是 `int(基准 * glass_k)`，量化 0.1
+                         # 只差 1~2/255，肉眼看不出；但相邻几档会落进同一个
+                         # 缓存键，静态层就不用每帧重建（一帧省 20ms）
 
     def __init__(self):
         self.src = None
@@ -108,6 +114,14 @@ class GlassEngine:
         self._prep = None        # _raw 再叠面纱，逐帧从这里裁
         self._prep_wh = (0, 0)   # 预处理中心区域（= 窗口）的尺寸
         self._prep_pad = (0, 0, 0, 0)   # 实际可用余量 left/top/right/bottom
+        self._pscale = 1.0       # 预览缩放：1.0 = 全尺寸。>1 以外都把几何量
+                                 # （圆角、标题栏、阴影偏移）一起缩
+        self._k_quant = 0.0      # 预览时 glass_k 的量化步进，0 = 不量化
+        self._pl = None          # 预览用的静态层（半尺寸），与 `_layers`
+                                 # 分开存 —— 共用会把全尺寸那份覆盖掉
+        self._pl_key = None
+        self._rim_full = None    # 全尺寸棱边层，预览时在放大之后叠
+        self._rim_key = None
         self._prep_origin = (0, 0)      # 预处理大图左上角的屏幕坐标
         self._layers = None      # 静态装饰层缓存
         self._layers_key = None
@@ -243,6 +257,10 @@ class GlassEngine:
         self._prep_pad = (0, 0, 0, 0)
         self._prep_origin = (0, 0)
         self._veil_dirty = False
+        self._pl = None
+        self._pl_key = None
+        self._rim_full = None
+        self._rim_key = None
         self.drop_layers()
 
     @property
@@ -258,7 +276,12 @@ class GlassEngine:
             k = float(self.VEIL) / float(self.VEIL_DEFAULT)
         except (TypeError, ValueError, ZeroDivisionError):
             return 1.0
-        return max(0.35, min(1.75, k))
+        k = max(0.35, min(1.75, k))
+        # 拖动滑块的预览里量化一下，让静态层缓存能命中（见 PREVIEW_K_STEP）
+        step = float(getattr(self, "_k_quant", 0.0) or 0.0)
+        if step > 0:
+            k = round(k / step) * step
+        return k
 
     def glow_k(self):
         """彩色光斑/饱和度的强度系数：只在通透端减弱，磨砂端恒为 1。
@@ -384,8 +407,9 @@ class GlassEngine:
         self._prep_wh = (w, h)
         self._prep_pad = (x - x0, y - y0, x1 - (x + w), y1 - (y + h))
         self._prep_origin = (x0, y0)
-        self._layers = None
-        self._layers_key = None
+        # 静态层不用清：`_ensure_layers()` 的 key 里带着 w/h/cards/glass_k，
+        # 任何一项变了都会自己重建。这里硬清一次，等于每次松手拖窗口都白
+        # 重建一遍（99ms），而实际上尺寸和透明度都没动。
         return True
 
     def _finish_base(self, img):
@@ -401,13 +425,18 @@ class GlassEngine:
         return Image.blend(img, veil, max(0.0, min(1.0, float(self.VEIL))))
 
     # ------------------------------------------------------- 静态图层缓存
-    def build_layers(self, w, h, cards=(), decorators=()):
+    def build_layers(self, w, h, cards=(), decorators=(), store=True):
         """把只跟窗口尺寸/glass_k 有关的图层建好缓存起来（一次约 57ms）。
 
         噪点 + 卡片阴影 + 玻璃面 + 卡片柔光这四层都是 alpha 叠加，且顺序
         相邻，按结合律预合并成一张 RGBA，逐帧只合成一次（省 3 次全尺寸
         合成，代价是 ≤2/255 的舍入差）。光斑是 screen、顶部镜面是 add，
         不能并进 alpha 层，各自保留为独立图层。
+
+        Args:
+            store: 是否存进 `self._layers`。预览（半尺寸）要传 False ——
+                存进去会把全尺寸那份合法缓存覆盖掉，松手后 `frame()` 就会
+                拿着一张半尺寸的层去合成。
         """
         blank = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         black = Image.new("RGB", (w, h), (0, 0, 0))
@@ -425,14 +454,16 @@ class GlassEngine:
         for (x, y, cw, ch) in cards:
             overlay.alpha_composite(self.card_glow(cw, ch), (x, y))
 
-        self._layers = {
+        layers = {
             "glow": glow_layer, "sheen": sheen_layer,
             "overlay": overlay, "rim": rim_layer,
             "decorators": tuple(decorators),
         }
-        self._layers_key = (w, h, round(self.glass_k, 4), tuple(cards),
-                            tuple(decorators))
-        return self._layers
+        if store:
+            self._layers = layers
+            self._layers_key = (w, h, round(self.glass_k, 4), tuple(cards),
+                                tuple(decorators))
+        return layers
 
     def _ensure_layers(self, w, h, cards, decorators):
         key = (w, h, round(self.glass_k, 4), tuple(cards), tuple(decorators))
@@ -468,6 +499,118 @@ class GlassEngine:
         for (bx, by, bw, bh, kind) in buttons:
             img = self._paint_button(img, bx, by, bw, bh, kind, "normal")
         return img
+
+    # ------------------------------------------- 预览（拖动透明度滑块时）
+    def _rim_layer(self, w, h):
+        """全尺寸棱边层（缓存）。
+
+        棱边必须全尺寸叠：它是一条 1px 的白线，在半尺寸画出来再放大会
+        变成 2px，边框会显得粗一档。
+        """
+        if self._rim_full is None or self._rim_key != (w, h):
+            self._rim_full = self._rim(Image.new("RGBA", (w, h), (0, 0, 0, 0)))
+            self._rim_key = (w, h)
+        return self._rim_full
+
+    def _preview_layers(self, sw, sh, cards):
+        """预览专用的静态层缓存（半尺寸，与 `_layers` 分开存）。
+
+        键里的 `glow_k` 也按 0.05 量化：光斑是一层很淡的彩色光晕，强度差
+        5% 完全看不出来，但它是连续变化的 —— 不量化就等于每帧都换键，
+        缓存一次都命中不了。
+        """
+        key = (sw, sh, tuple(cards), round(self.glass_k, 4),
+               int(round(self.glow_k() / 0.05)))
+        if self._pl is None or self._pl_key != key:
+            self._pl = self.build_layers(sw, sh, cards, (), store=False)
+            self._pl_key = key
+        return self._pl
+
+    def preview_frame(self, cards=(), decorators=(), dx=0, dy=0, scale=None):
+        """拖动透明度滑块时的一帧：整条链路在半尺寸下跑，最后放大回来。
+
+        和 `frame()` 的三处不同，全是为了抢时间：
+
+        1. **底图从 `_src_raw` 裁窗口那块**，不碰 `_prep`。`_prep` 是含
+           视差余量的预处理图，重算一次要 149ms；而拖滑块时窗口一动不动，
+           只有窗口那 980×800 会被人看到 —— 这一条就把 149ms 变成 32ms。
+        2. **模糊、调色、合成都在半尺寸做**再放大（`PREVIEW_SCALE`）。模糊
+           是主要成本且按像素数线性涨，半尺寸等于 4 倍加速；拖动时用户盯
+           的是"透不透"，背景纹理差半个像素根本看不出来。
+        3. **静态层走独立缓存**（`_pl`），不覆盖全尺寸那份 `_layers`。
+
+        像素上它和 `frame()` 不等价（差在模糊的采样粒度），所以它只用于
+        拖动过程中的即时反馈；松手后由 `recompose()` 出一张精确的。
+
+        Args:
+            cards: 卡片矩形（窗口坐标，全尺寸）。
+            decorators: 装饰层。它们用绝对坐标画，只能放在放大之后叠。
+            dx, dy: 窗口相对预处理基准位置的位移，一般传 0（拖滑块时窗口
+                不动），传了也能算对，只是会有一部分区域来自旧像素。
+            scale: 覆盖 `PREVIEW_SCALE`，主要给测试用。
+
+        Returns:
+            PIL.Image | None: 窗口尺寸的 RGB 图；抓图还没就绪时返回 None。
+        """
+        if self._src_raw is None:
+            return None
+        w, h = self._prep_wh
+        if w <= 0 or h <= 0:
+            return None
+        s = float(self.PREVIEW_SCALE if scale is None else scale)
+        s = max(0.25, min(1.0, s))
+        sw = max(8, int(round(w * s)))
+        sh = max(8, int(round(h * s)))
+        full = (sw, sh) == (w, h)
+
+        # ---- 1) 底图：裁窗口那块 → 缩小 → 同一条像素链 ----
+        pad_l, pad_t = self._prep_pad[0], self._prep_pad[1]
+        src_w, src_h = self._src_raw.size
+        x0 = max(0, min(src_w - w, pad_l + int(dx)))
+        y0 = max(0, min(src_h - h, pad_t + int(dy)))
+        core = self._src_raw.crop((x0, y0, x0 + w, y0 + h))
+        if not full:
+            core = core.resize((sw, sh), Image.BILINEAR)
+        core = core.filter(ImageFilter.GaussianBlur(
+            self.blur if full else max(1.0, self.blur * s)))
+        core = ImageEnhance.Color(core).enhance(1.0 + 1.05 * self.glow_k())
+        core = ImageEnhance.Brightness(core).enhance(0.96)
+        core = Image.blend(core, Image.new("RGB", (sw, sh), (13, 15, 23)),
+                           max(0.0, min(1.0, float(self.VEIL))))
+
+        # ---- 2) 静态层（半径、阴影偏移等绝对量都跟着缩）----
+        cards_s = [(int(round(x * s)), int(round(y * s)),
+                    int(round(cw * s)), int(round(ch * s)))
+                   for (x, y, cw, ch) in cards]
+        old_s, old_title = self._pscale, self.TITLE_H
+        old_q = self._k_quant
+        self._pscale = s
+        self._k_quant = self.PREVIEW_K_STEP
+        if not full and self.TITLE_H > 0:
+            self.TITLE_H = max(1, int(round(self.TITLE_H * s)))
+        try:
+            L = self._preview_layers(sw, sh, cards_s)
+            img = ImageChops.screen(core, L["glow"])
+            img = ImageChops.add(img, L["sheen"])
+            img = Image.alpha_composite(img.convert("RGBA"), L["overlay"])
+        finally:
+            self._pscale = old_s
+            self.TITLE_H = old_title
+            self._k_quant = old_q
+
+        if not full:
+            img = img.resize((w, h), Image.BILINEAR)
+
+        # ---- 3) 装饰层与棱边：绝对坐标，只能叠在全尺寸上 ----
+        for fn in decorators:
+            try:
+                img = fn(img)
+            except Exception:
+                pass
+        rim = self._rim_layer(w, h)
+        if rim is not None:
+            img = Image.alpha_composite(img.convert("RGBA"), rim)
+        return img.convert("RGB")
 
     def compose(self, w, h, cards=(), buttons=(), decorators=(), offset=None):
         """生成最终底图（接口不变）。有预处理大图就直接裁一帧，否则现场做。
@@ -565,6 +708,15 @@ class GlassEngine:
         return out.convert("RGB")
 
     # ---------------------------------------------------------- 静态玻璃层
+    def _g(self, v, lo=1):
+        """按预览缩放取一个几何量（圆角半径、阴影偏移、模糊半径）。
+
+        `_pscale` 为 1 时原样返回，所以全尺寸路径逐像素不变；预览在半尺寸
+        下跑时，圆角、阴影偏移这些绝对值也得跟着缩，否则放大回窗口尺寸后
+        卡片会变成大圆角、阴影会拖得很远。
+        """
+        return max(lo, int(round(v * self._pscale)))
+
     def _card_shadow(self, img, cards):
         if not cards:
             return img
@@ -574,10 +726,11 @@ class GlassEngine:
         ds = ImageDraw.Draw(sh)
         for (x, y, cw, ch) in cards:
             # 往下偏移 6px 再模糊，做出"卡片浮在玻璃上"的投影
-            ds.rounded_rectangle([x + 2, y + 6, x + cw - 2, y + ch + 8],
-                                 radius=self.CARD_R,
+            ds.rounded_rectangle([x + self._g(2), y + self._g(6),
+                                  x + cw - self._g(2), y + ch + self._g(8)],
+                                 radius=self._g(self.CARD_R),
                                  fill=(0, 0, 0, int(120 * k)))
-        sh = sh.filter(ImageFilter.GaussianBlur(14))
+        sh = sh.filter(ImageFilter.GaussianBlur(self._g(14)))
         return Image.alpha_composite(img, sh)
 
     def _glass(self, img, cards):
@@ -600,13 +753,14 @@ class GlassEngine:
         # 卡片本体：白色极低 alpha 填充 + 双层描边。alpha 随面纱系数缩放，
         # 否则调到最通透时卡片边界会整个消失
         for (x, y, cw, ch) in cards:
+            r = self._g(self.CARD_R)
             d.rounded_rectangle([x, y, x + cw, y + ch],
-                                radius=self.CARD_R,
+                                radius=r,
                                 fill=(255, 255, 255, int(16 * k)))
-            d.rounded_rectangle([x, y, x + cw, y + ch], radius=self.CARD_R,
+            d.rounded_rectangle([x, y, x + cw, y + ch], radius=r,
                                 outline=(255, 255, 255, int(52 * k)), width=1)
             d.rounded_rectangle([x + 1, y + 1, x + cw - 1, y + ch - 1],
-                                radius=self.CARD_R - 1,
+                                radius=max(1, r - 1),
                                 outline=(255, 255, 255, int(14 * k)), width=1)
 
         return Image.alpha_composite(img, gl)
@@ -623,7 +777,8 @@ class GlassEngine:
                     fill=(255, 255, 255, int(11 * k * t * t)))
         m = Image.new("L", (cw, top_h), 0)
         ImageDraw.Draw(m).rounded_rectangle(
-            [0, 0, cw - 1, top_h + self.CARD_R], radius=self.CARD_R, fill=255)
+            [0, 0, cw - 1, top_h + self._g(self.CARD_R)],
+            radius=self._g(self.CARD_R), fill=255)
         g.putalpha(ImageChops.multiply(g.split()[3], m))
         return g
 

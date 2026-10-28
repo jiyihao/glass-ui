@@ -43,6 +43,21 @@ class GlassWindow:
     # 收小余量，宁可远处被夹住也别让启动卡顿几百毫秒。2560x1440 仍覆盖。
     PREP_MAX_PX = 4_400_000
 
+    #: 拖动窗口时只移动一圈白框，松手才把界面平移过去。
+    #:
+    #: 这是 Windows 关掉「拖动时显示窗口内容」之后的行为，很多专业软件也
+    #: 这么做。好处不只是省 CPU（拖动帧从 31ms 直接归零），更重要的是**位置
+    #: 判断变准了** —— 内容跟着鼠标走的时候，人眼看到的是"整个桌面在反向
+    #: 滑"，很难判断窗口边缘落在哪；只有一圈等大的框时，边界一目了然。
+    #:
+    #: 关掉它则退回旧行为：逐帧重算玻璃 + 拖动视差（内容跟着走，玻璃后
+    #: 的桌面反向平移）。
+    DRAG_OUTLINE = True
+
+    #: 轮廓框的透明键色。Tk 没有异形窗口 API，只能指定一个"键色"让该颜色
+    #: 整块透掉，所以用这种正常界面里绝不会出现的洋红。
+    OUTLINE_KEY = "#ff00fe"
+
     # -------------------------------------------------------------- 生命周期
     def __init__(self, root, shot=False, title=None, glass_opacity=None):
         """初始化窗口。
@@ -79,6 +94,13 @@ class GlassWindow:
         self._drag_frames = 0
         self._drag_t0 = 0.0
         self._drag_need_prep = False
+        # 白框拖动：_outline 是那个跟随鼠标的 Toplevel，_outline_moved 记
+        # 这次拖动是否真的挪动过（单击不该触发一次重抓）
+        self._outline = None
+        self._outline_cv = None
+        self._outline_key = False
+        self._outline_pending = False
+        self._outline_moved = False
 
         self.fit_screen()
         self.setup_window()
@@ -220,6 +242,7 @@ class GlassWindow:
         }
 
     def close(self):
+        self._destroy_outline()
         try:
             self.root.destroy()
         except Exception:
@@ -241,6 +264,151 @@ class GlassWindow:
     #
     # 代价是每帧都要合成。所以引擎里做了两级缓存（见 engine 模块头），
     # 逐帧只要 13~18ms；事件还必须合并，否则 125Hz 的鼠标上报会积压成雪崩。
+    # ---------------------------------------------------------- 拖动轮廓框
+    def _outline_win(self):
+        """懒建那个跟着鼠标走的白框（只建一次，之后反复挪位置）。
+
+        为什么非要 `-transparentcolor`：框必须是**空心**的，只有边线可见。
+        Tk 画布没有 alpha，做不出"中间透掉、边线不透明"，只能让一个键色
+        整块透明，再把画布底色和窗口底色都设成那个键色，只在上面画白线。
+        """
+        if self._outline is not None:
+            return self._outline
+        try:
+            top = tk.Toplevel(self.root)
+        except Exception:
+            return None
+        top.withdraw()
+        try:
+            top.overrideredirect(True)
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        bg = "#0b0e14"
+        try:
+            top.configure(bg=self.OUTLINE_KEY)
+            top.attributes("-transparentcolor", self.OUTLINE_KEY)
+            bg = self.OUTLINE_KEY
+            self._outline_key = True
+        except Exception:
+            # 极少数环境没有透明键色：退化成"淡雾面 + 白边"。会遮住主窗口
+            # 一点，但至少看得见框在哪
+            top.configure(bg=bg)
+            try:
+                top.attributes("-alpha", 0.30)
+            except Exception:
+                pass
+            self._outline_key = False
+        cv = tk.Canvas(top, bg=bg, highlightthickness=0, bd=0)
+        cv.place(x=0, y=0, relwidth=1, relheight=1)
+        self._outline = top
+        self._outline_cv = cv
+        return top
+
+    def _paint_outline(self, w, h):
+        """重画轮廓：一层冷白打底 + 一圈亮白主轮廓 + 顶部加亮。
+
+        为什么要两层边线：纯白线在浅色壁纸上会"消失"，加一层稍暗的冷白
+        打底后，深浅背景上都有一条能看清的界线。
+        """
+        cv = self._outline_cv
+        if cv is None:
+            return
+        try:
+            cv.delete("all")
+            cv.create_rectangle(1, 1, w - 2, h - 2,
+                                outline="#7d8aa0", width=1)
+            cv.create_rectangle(2, 2, w - 3, h - 3,
+                                outline="#ffffff", width=2)
+            # 顶部一道更亮的线：暗示这里是标题栏、可以抓
+            cv.create_line(4, 3, w - 5, 3, fill="#ffffff", width=2)
+        except Exception:
+            pass
+
+    def _begin_outline(self):
+        """按下鼠标时：把框摆到窗口当前位置并显示出来。"""
+        top = self._outline_win()
+        if top is None:
+            return False
+        self._paint_outline(self.win_w, self.win_h)
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        self._outline_moved = False
+        self._drag_target = (x, y)
+        try:
+            top.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
+            top.deiconify()
+            top.lift()
+        except Exception:
+            return False
+        return True
+
+    def _queue_outline_move(self):
+        """合并连续的鼠标移动，一个事件循环只挪一次框。
+
+        鼠标上报 125Hz，而挪一个无边框窗口要走 SetWindowPos。单次很便宜，
+        但一秒上千次的排队会让 Tk 的事件队列跟不上鼠标，框反而滞后。
+        """
+        if self._outline_pending:
+            return
+        self._outline_pending = True
+        self.root.after(1, self._flush_outline_move)
+
+    def _flush_outline_move(self):
+        self._outline_pending = False
+        top = self._outline
+        if top is None or self._drag_target is None:
+            return
+        x, y = self._drag_target
+        try:
+            top.geometry(f"+{x}+{y}")
+        except Exception:
+            return
+        self._outline_moved = True
+
+    def _hide_outline(self):
+        top = self._outline
+        if top is None:
+            return
+        try:
+            top.withdraw()
+        except Exception:
+            pass
+
+    def _destroy_outline(self):
+        top = self._outline
+        self._outline = None
+        self._outline_cv = None
+        if top is not None:
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+    def _move_window_to(self, x, y):
+        """把窗口摆到白框松手的位置，然后重抓一次背景。
+
+        为什么必须重抓、不能挪旧图：玻璃透的是窗口背后那块桌面，窗口一
+        整块挪走，背后的桌面就整块换人了。算"旧图平移多少像素"就是原来
+        的视差逻辑，松手只发生一次，直接重抓更干净。
+        """
+        old = (self.root.winfo_x(), self.root.winfo_y())
+        try:
+            self.root.geometry(f"+{int(x)}+{int(y)}")
+            self.root.update_idletasks()
+        except Exception:
+            return
+        self._win_x, self._win_y = int(x), int(y)
+        try:
+            self.on_window_moved(int(x), int(y),
+                                 int(x) - old[0], int(y) - old[1])
+        except Exception:
+            pass
+        # 位置变了 -> `_prep_still_valid()` 自然返回 False，会重抓重模糊
+        self.rebuild_background()
+
+    def on_window_moved(self, x, y, dx, dy):
+        """窗口被拖到新位置后的回调（子类可覆写，比如让弹窗一起跟过去）。"""
+
     def drag_start(self, e):
         self._drag = (e.x_root, e.y_root,
                       self.root.winfo_x(), self.root.winfo_y())
@@ -249,12 +417,20 @@ class GlassWindow:
         self._drag_frames = 0
         self._drag_t0 = time.perf_counter()
         self._slice_tick = 0
+        self._drag_need_prep = False
+        if self.DRAG_OUTLINE:
+            self._begin_outline()
 
     def drag_move(self, e):
         if not self._drag:
             return
         x = self._drag[2] + e.x_root - self._drag[0]
         y = self._drag[3] + e.y_root - self._drag[1]
+        if self.DRAG_OUTLINE:
+            # 只挪框：窗口、底图、切片一概不碰，这一帧的渲染成本是 0
+            self._drag_target = (x, y)
+            self._queue_outline_move()
+            return
         try:
             self.root.geometry(f"+{x}+{y}")
         except Exception:
@@ -283,6 +459,35 @@ class GlassWindow:
             return
         if self._apply_frame_image(img):
             self._drag_frames += 1
+
+    def preview_opacity(self):
+        """拖动透明度滑块时的即时预览（约 40ms 一帧）。
+
+        为什么不走 `rebuild_background()`：那一趟要抓屏 + 全屏模糊 + 重绘
+        几百个图元，200ms 起，滑块根本跟不上（松手才更新，滑的时候全静止）。
+        这里只做重算窗口区域 + 换贴图 + 刷切片，一个图元都不重排。
+
+        与真拖动共用 `_apply_frame_image()` 那条快路 —— 它复用常驻 PhotoImage
+        并隔帧刷切片，是拖动帧已经验证过的一条路。
+
+        Returns:
+            bool: 是否成功画上了一帧。
+        """
+        if not self.engine.ok:
+            return False
+        try:
+            gx, gy = self._grab_origin()
+            dx, dy = self.engine.shift_for(gx, gy)
+        except Exception:
+            dx, dy = 0, 0
+        try:
+            img = self.engine.preview_frame(
+                self.glass_cards(), self.glass_decorators(), dx, dy)
+        except Exception:
+            return False
+        if img is None:
+            return False
+        return self._apply_frame_image(img)
 
     def _apply_frame_image(self, img):
         """只换底图贴图的像素，不重绘任何图元 —— 拖动帧的快路。
@@ -347,8 +552,18 @@ class GlassWindow:
 
     def drag_end(self, _e=None):
         self._drag = None
-        self._drag_target = None
         self._drag_pending = False
+        target = self._drag_target
+        self._drag_target = None
+
+        if self.DRAG_OUTLINE:
+            self._hide_outline()
+            # 单击（没挪动）不该触发一次 200ms 的重抓
+            if target is not None and self._outline_moved:
+                self._outline_moved = False
+                self._move_window_to(*target)
+            return
+
         # 切片是隔帧刷的，最后一帧可能少刷一次，补上（否则松手后表格
         # 底下会留一帧错位的玻璃纹理，停下来盯着看能看出来）
         if self._drag_frames and self._bg_img is not None:
@@ -403,7 +618,7 @@ class GlassWindow:
         return (ox + pad[0], oy + pad[1]) == (int(gx), int(gy))
 
     def _prep_margin(self, gx, gy, w, h):
-        """抓屏余量：取到"能拖遍整个桌面"为止。
+        """抓屏余量：用视差拖动时取到"能拖遍整个桌面"，白框拖动则取 0。
 
         固定 220px 的问题：拖出 220 像素之后 `frame()` 就被夹住，窗口还在
         动、玻璃里的桌面却钉在原地 —— 比完全没有视差更违和（用户把窗口从
@@ -414,6 +629,11 @@ class GlassWindow:
         面积超过 `PREP_MAX_PX` 时按 0.7 逐次收小 —— 超大桌面（双 4K）上
         保住启动速度比保住远处视差重要。
         """
+        if self.DRAG_OUTLINE:
+            # 白框拖动时窗口在松手前一动不动，逐帧平移那套完全用不上，
+            # 余量纯属浪费：全屏 2560x1440 的预处理图光模糊就要 94ms，
+            # 只抓窗口那块是 19ms。松手后本来就要重抓一次，那一次也快 5 倍。
+            return 0
         m = int(self.engine.PAD)
         try:
             vs = virtual_screen_rect()

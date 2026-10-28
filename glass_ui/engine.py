@@ -65,15 +65,21 @@ from .theme import R_CARD, R_WIN
 class GlassEngine:
     """抓屏 + 合成。一个窗口一个实例，重复 compose 不会重复抓屏。"""
 
-    BLUR = 18            # 高斯模糊半径。30 是历史值，但实测它单独就吃掉
-                         # 约一半的桌面结构（见 docs/PITFALLS.md 第 23 条），
-                         # 面纱再一压就只剩色块。18 仍保留磨砂质感，纹理可辨
+    BLUR = 18            # 高斯模糊半径（透明度 = OPACITY_DEFAULT 时）。
+                         # 30 是历史值，但实测它单独就吃掉约一半的桌面结构
+                         # （见 docs/PITFALLS.md 第 23 条），18 仍保留磨砂质感。
+                         # 两端按 BLUR_*_RATIO 缩放：越透明越清晰，越磨砂越糊
+    BLUR_CLEAR_RATIO = 4.0 / 18.0    # 透明度 100% 时的模糊 = BLUR * 这个比例
+    BLUR_FROST_RATIO = 30.0 / 18.0   # 透明度 0% 时
     VEIL = 0.40          # 深色面纱强度。越低越透、文字越难读
     VEIL_DEFAULT = 0.40  # 出厂值，`glass_k` 用它做归一化；改它等于改整条基线
-    VEIL_MIN = 0.12      # 透明度 100% 时的面纱强度。历史上是 0.42、后来 0.18，
-                         # 但光斑、饱和度不随之缩放，导致最透明端反而像一块
-                         # 浓郁的蓝紫青渐变"调色板"——配合 glow_k() 才通透
-    VEIL_MAX = 0.92      # 透明度 0% 时的面纱强度
+    VEIL_MIN = 0.02      # 透明度 100% 时的面纱强度 —— 近乎无膜。
+                         # 模糊才是通透的瓶颈：veil 从 0.12 压到 0.02 只多透
+                         # 4 个点，而模糊 18→4 能把透过率从 16% 抬到 34%
+                         # （_diag31/probe_veil.py 实测），所以两端一起动
+    VEIL_MAX = 0.78      # 透明度 0% 时的面纱强度 = 旧版（0.1.6）透明度 60%
+                         # 的面纱（0.96 + 60/74*(0.74-0.96) = 0.782），
+                         # 配合 BLUR_FROST_RATIO 复刻那个"浓磨砂"观感
     OPACITY_DEFAULT = 74 # 用户侧的默认透明度（百分比），与 VEIL_DEFAULT 对应
     CARD_R = R_CARD
     WIN_R = R_WIN
@@ -89,12 +95,16 @@ class GlassEngine:
         # 而类属性一改会波及所有实例，所以统一复制一份到实例上。
         self.BLUR = type(self).BLUR
         self.VEIL = type(self).VEIL
+        self.OPACITY = float(type(self).OPACITY_DEFAULT)
         self.CARD_R = type(self).CARD_R
         self.WIN_R = type(self).WIN_R
         self.TITLE_H = type(self).TITLE_H
 
         # ---- 两级缓存（见模块头）----
+        self._src_raw = None     # 抓到的原始桌面（未模糊）。改模糊半径要靠它
+                                 # 重算，否则每次都得重新抓屏
         self._raw = None         # 预处理大图：模糊+提饱和+降亮，未叠面纱
+        self._raw_blur = None    # _raw 用的模糊半径，用来判断要不要重建
         self._prep = None        # _raw 再叠面纱，逐帧从这里裁
         self._prep_wh = (0, 0)   # 预处理中心区域（= 窗口）的尺寸
         self._prep_pad = (0, 0, 0, 0)   # 实际可用余量 left/top/right/bottom
@@ -114,11 +124,11 @@ class GlassEngine:
         ========  ==========  ==============================
         透明度     面纱系数     说明
         ========  ==========  ==============================
-        0         0.92        磨砂感最强
+        0         0.78        磨砂感最强，等同旧版（0.1.6）的 60%
         74        0.40        出厂值。旧版这里是 0.74，配合 BLUR=30 实测桌面
                              只透出 5%，观感就是一块"自带底色的色板"，被用户
                              判定为"玻璃感没了"。0.40 + BLUR=18 透出约 15%
-        100       0.12        最通透，桌面内容清楚可辨
+        100       0.02        几乎没有膜，桌面原样透出来
         ========  ==========  ==============================
         """
         try:
@@ -132,6 +142,30 @@ class GlassEngine:
             return cls.VEIL_DEFAULT + t * (cls.VEIL_MIN - cls.VEIL_DEFAULT)
         t = o / max(1e-6, pivot)
         return cls.VEIL_MAX + t * (cls.VEIL_DEFAULT - cls.VEIL_MAX)
+
+    @classmethod
+    def blur_for_opacity(cls, opacity):
+        """透明度 → 模糊半径。与面纱同一条折线，两端对称地缩放。
+
+        通透端必须降模糊：面纱压到 0.02 之后画面里已经没有膜了，剩下的
+        糊完全是高斯模糊造成的 —— 只降面纱不降模糊，用户看到的还是"雾"，
+        不是玻璃。磨砂端反过来加模糊，复刻旧版浓磨砂的手感。
+
+        缩放比而非绝对值：外部只想整体调软/调硬时改 `BLUR` 一处即可。
+        """
+        try:
+            o = float(opacity)
+        except (TypeError, ValueError):
+            o = float(cls.OPACITY_DEFAULT)
+        o = max(0.0, min(100.0, o))
+        pivot = float(cls.OPACITY_DEFAULT)
+        if o <= pivot:
+            t = 1.0 - o / max(1e-6, pivot)
+            ratio = 1.0 + t * (float(cls.BLUR_FROST_RATIO) - 1.0)
+        else:
+            t = (o - pivot) / max(1e-6, 100.0 - pivot)
+            ratio = 1.0 + t * (float(cls.BLUR_CLEAR_RATIO) - 1.0)
+        return max(0.6, float(cls.BLUR) * ratio)
 
     @classmethod
     def veil_to_opacity(cls, veil):
@@ -151,12 +185,27 @@ class GlassEngine:
 
     def set_opacity(self, opacity):
         """按用户语义设置透明度，返回实际生效的百分比（已夹到 0~100）。"""
-        self.VEIL = self.opacity_to_veil(opacity)
+        try:
+            self.OPACITY = max(0.0, min(100.0, float(opacity)))
+        except (TypeError, ValueError):
+            self.OPACITY = float(self.OPACITY_DEFAULT)
+        self.VEIL = self.opacity_to_veil(self.OPACITY)
         # 面纱 -> 底图要重 blend；glass_k -> 静态层（卡片 alpha）要重建。
-        # 模糊/提饱和那一步不依赖 VEIL，`_raw` 保留，省掉 40ms 的模糊。
+        # 模糊半径也挂了透明度（见 blur_for_opacity），所以 `_raw` 不一定
+        # 还能用 —— 但也不在这里重算：滑块一秒来几十个事件，等真要出图时
+        # `_ensure_prep()` 按 `_raw_blur` 判断一次就够（一档半径约 110ms）。
         self.reveil()
         self.drop_layers()
         return int(round(self.veil_to_opacity(self.VEIL)))
+
+    @property
+    def blur(self):
+        """当前该用的模糊半径（跟着 OPACITY 走）。
+
+        取整：滑块每动一格都会重算一遍预处理图（约 110ms），相邻两格
+        四舍五入后经常落在同一个整数上，可以直接沿用旧图不重算。
+        """
+        return round(self.blur_for_opacity(self.OPACITY))
 
     def reveil(self):
         """标记面纱需要重算（改透明度走这里）。
@@ -169,7 +218,12 @@ class GlassEngine:
             self._veil_dirty = True
 
     def _ensure_prep(self):
-        """面纱脏了就重算一次（惰性）。"""
+        """面纱/模糊脏了就重算一次（惰性）。"""
+        if self._src_raw is not None and self._raw_blur != self.blur:
+            # 模糊半径变了：整条预处理链要重走（约 110ms，只在换档时发生）
+            self._raw = self._finish_base(self._src_raw)
+            self._raw_blur = self.blur
+            self._veil_dirty = True
         if self._raw is not None and self._veil_dirty:
             self._prep = self._apply_veil(self._raw)
             self._veil_dirty = False
@@ -181,7 +235,9 @@ class GlassEngine:
 
     def invalidate(self):
         """全部作废：换窗口尺寸、重新抓屏、换卡片布局时调用。"""
+        self._src_raw = None
         self._raw = None
+        self._raw_blur = None
         self._prep = None
         self._prep_wh = (0, 0)
         self._prep_pad = (0, 0, 0, 0)
@@ -212,11 +268,13 @@ class GlassEngine:
         越重 —— 用户调到 100% 看到的不是清透玻璃，而是一块浓郁的
         蓝紫青渐变调色板。所以让它们跟着面纱一起淡出：
 
-            veil = 0.18（透明度 100%）→ 0.35   光斑饱和度剩三成半
-            veil >= 0.74（≤出厂透明度）→ 1.0    出厂端逐像素不变
+            veil = 0.02（透明度 100%）→ 0.15   光斑基本收干净，只剩一点色散
+            veil >= 0.40（≤出厂透明度）→ 1.0    出厂端逐像素不变
 
-        返回值下限 0.35 而不是 0：完全去掉光斑会显得死白，留一点
-        色散感才像"玻璃"而不是"亚克力板"。
+        下限不取 0：完全去掉光斑会显得死白，留一丝折射感才像"玻璃"
+        而不是"亚克力板"。透明度上限放宽之后下限从 0.35 降到 0.15 ——
+        面纱只剩 0.02、模糊只剩 4，桌面原色已经完整透出来，再叠 37%
+        的提饱和就不是"透"而是"染色"了。
         """
         try:
             span = float(self.VEIL_DEFAULT) - float(self.VEIL_MIN)
@@ -224,7 +282,7 @@ class GlassEngine:
         except (TypeError, ValueError):
             return 1.0
         t = max(0.0, min(1.0, t))
-        return 0.35 + 0.65 * t
+        return 0.15 + 0.85 * t
 
     # ------------------------------------------------------------------ 抓屏
     def grab(self, x, y, w, h):
@@ -318,7 +376,9 @@ class GlassEngine:
         # 余量，`frame()` 本来就不要求对称。
         full = core
 
+        self._src_raw = full
         self._raw = self._finish_base(full)
+        self._raw_blur = self.blur
         self._prep = self._apply_veil(self._raw)
         self._veil_dirty = False
         self._prep_wh = (w, h)
@@ -330,7 +390,7 @@ class GlassEngine:
 
     def _finish_base(self, img):
         """底图的像素级处理：模糊 → 提饱和 → 降亮。不依赖窗口位置。"""
-        img = img.filter(ImageFilter.GaussianBlur(self.BLUR))
+        img = img.filter(ImageFilter.GaussianBlur(self.blur))
         # 提饱和的幅度跟着 glow_k 走：74% 时恰为 1.0 + 1.05 = 2.05，与
         # 旧版逐像素一致；越通透加得越少，否则薄面纱 + 高饱和 = 油彩感
         img = ImageEnhance.Color(img).enhance(1.0 + 1.05 * self.glow_k())
@@ -433,7 +493,9 @@ class GlassEngine:
                     base = None
             if base is None:
                 base = self._synthetic(w, h)
+            self._src_raw = base
             self._raw = self._finish_base(base)
+            self._raw_blur = self.blur
             self._prep = self._apply_veil(self._raw)
             self._veil_dirty = False
             self._prep_wh = (w, h)

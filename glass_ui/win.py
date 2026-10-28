@@ -26,6 +26,13 @@ GA_ROOT = 2
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
+# GetSystemMetrics 的索引。76~79 是「虚拟桌面」（多屏合起来的外接矩形，
+# 副屏在主屏左侧时 x 为负，所以抓屏坐标要允许负数）
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
 # SetWindowPos 的标志位。改完扩展样式必须带 SWP_FRAMECHANGED 再打一次
 # SetWindowPos，系统才会重算窗口框架（WM_NCCALCSIZE），任务栏按钮也才会真的
 # 出现 —— 只调 SetWindowLongW(GWL_EXSTYLE) 时样式改了但外壳没刷新。
@@ -164,3 +171,18 @@ def set_capture_affinity(widget, enable=True):
             hwnd, WDA_EXCLUDEFROMCAPTURE if enable else WDA_NONE)
     except Exception:
         pass
+
+
+def virtual_screen_rect():
+    """虚拟桌面矩形 (x, y, w, h)，多屏时覆盖所有显示器。
+
+    拖动视差要抓一张比窗口更大的图当余量，越界部分 Pillow 会补黑块 ——
+    玻璃里露一条黑边很难看，所以抓之前必须先按这个矩形夹一遍。
+    """
+    try:
+        return (user32.GetSystemMetrics(SM_XVIRTUALSCREEN),
+                user32.GetSystemMetrics(SM_YVIRTUALSCREEN),
+                user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    except Exception:
+        return None

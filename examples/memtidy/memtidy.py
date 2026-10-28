@@ -60,7 +60,7 @@ from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
 from glass_ui.win import apply_round_region, make_taskbar_window
 
 APP_NAME = "内存整理器"
-APP_VER = "2.4"
+APP_VER = "2.5"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 
@@ -70,7 +70,9 @@ CARD_TABLE = (18, 210, 944, 330)
 TABLE_HEAD_H = 50
 BTN_Y = 550
 BTN_H = 50
-CARD_LOG = (18, 608, 944, 116)
+CARD_LOG = (18, 608, 944, 176)      # 高 176：日志视口 (176-26-1)//21 = 7 行。
+                                    # 旧版 116 只放得下 4 行，深度整理的 5 步
+                                    # 分步释放量会被挤出视口，等于白算
 MEM_BADGE = (806, 82, 132, 30)      # 内存卡右上角「可用」徽章
 LOG_HEAD_H = 26
 
@@ -698,6 +700,21 @@ def is_protected(name):
     return name.lower() in PROTECTED
 
 
+# 名字里带这些词的，基本都是随驱动/厂商套件装进来的常驻服务。它们拿得到
+# PROCESS_TERMINATE 句柄（所以 kill_tier 判成"可结束"），但结束之后 SCM
+# 或厂商守护进程会立刻把它们拉起来。用户照着智能提示去点"结束选中进程"，
+# 再回到同一个界面看到内存没降，只会认为工具失效 —— 所以必须单独标注。
+SERVICE_WORDS = ("service", "svc", "agent", "update", "updater", "protect",
+                 "manager", "daemon", "watchdog", "guard", "telemetry")
+
+
+def is_service_like(name):
+    low = name.lower()
+    if low.endswith(".exe"):
+        low = low[:-4]
+    return any(w in low for w in SERVICE_WORDS)
+
+
 def kill_tier(name, pid):
     """给进程分"能不能结束"的三档，排序和备注都靠它。
 
@@ -729,6 +746,10 @@ def row_tag_note(name, tier):
     low = name.lower()
     if low in BACKGROUND_HINTS:
         return "bgapp", BACKGROUND_HINTS[low] + " · 可结束"
+    if is_service_like(name):
+        # 排在 BACKGROUND_HINTS 之后：用户自己认识的应用（微信/Chrome）
+        # 信息量更大，先报那个
+        return "svc", "系统服务 · 结束会被拉起"
     return "normal", ""
 
 
@@ -744,7 +765,7 @@ class MemTidyApp(GlassWindow):
 
     TITLE = APP_TITLE
     WIN_W = 980
-    WIN_H = 744
+    WIN_H = 800
 
     def __init__(self, root, shot=False):
         # 业务状态先备好：super().__init__ 里会立刻调用 build_ui()
@@ -865,13 +886,16 @@ class MemTidyApp(GlassWindow):
         self.f_unit = tkfont.Font(family=FONT_UI, size=12)
         self.f_tot = tkfont.Font(family=FONT_UI, size=11)
 
-        # 纵向重排：窗口偏矮时压缩表格卡
-        table_h = CARD_TABLE[3] + (h - 744)
+        # 纵向重排：窗口偏矮时压缩表格卡。
+        # 基线用 self.WIN_H（设计高度）而不是写死 744：改窗口高度时这里
+        # 若还写 744，(h - 744) 会变成正数，把按钮和日志卡推出窗口外。
+        dh = h - self.WIN_H
+        table_h = CARD_TABLE[3] + dh
         self.geo = {
             "mem": CARD_MEM,
             "table": (CARD_TABLE[0], CARD_TABLE[1], CARD_TABLE[2], max(250, table_h)),
-            "btn_y": BTN_Y + (h - 744),
-            "log": (CARD_LOG[0], CARD_LOG[1] + (h - 744), CARD_LOG[2], CARD_LOG[3]),
+            "btn_y": BTN_Y + dh,
+            "log": (CARD_LOG[0], CARD_LOG[1] + dh, CARD_LOG[2], CARD_LOG[3]),
         }
 
         self.make_canvas()
@@ -885,9 +909,9 @@ class MemTidyApp(GlassWindow):
         # bgapp 橙（可结束的后台程序）/ prot 灰（保护名单）/
         # locked 暗灰（拿不到终止句柄的受保护进程）
         self.table.ROW_FG = {"bgapp": C_ORANGE, "prot": "#949db0",
-                             "locked": "#8a92a6"}
+                             "locked": "#8a92a6", "svc": "#8fb4d9"}
         self.table.ROW_DOT = ("bgapp",)
-        self.table.NOTE_FG = {"bgapp": C_ORANGE}
+        self.table.NOTE_FG = {"bgapp": C_ORANGE, "svc": "#8fb4d9"}
 
         # 表头右侧：搜索框 + 排序循环按钮（刷新按钮在 _draw_table_head 里建）
         self.search_var = tk.StringVar(value=self.SEARCH_HINT)
@@ -990,9 +1014,12 @@ class MemTidyApp(GlassWindow):
         w, h = self.win_w, self.win_h
 
         if self.bg_photo is not None:
-            cv.create_image(0, 0, image=self.bg_photo, anchor="nw")
+            # tags="bg" 给拖动帧用：那时只 itemconfigure 换这张图，
+            # 不像现在这样 delete("all") 重画几百个图元
+            cv.create_image(0, 0, image=self.bg_photo, anchor="nw",
+                            tags=("bg",))
         else:
-            cv.create_rectangle(0, 0, w, h, fill=C_BG, outline="")
+            cv.create_rectangle(0, 0, w, h, fill=C_BG, outline="", tags=("bg",))
 
         self._draw_titlebar(cv, w)
         self._draw_mem_card(cv)
@@ -1173,7 +1200,7 @@ class MemTidyApp(GlassWindow):
         self.txt_detail = (f"使用率 {m['percent']:>5.1f}%    "
                            f"系统缓存 {m['cache_mb']/1024:.2f} GB    "
                            f"已提交 {m['commit_mb']/1024:.2f} GB    "
-                           f"页面文件 {m['pagefile_pct']:.0f}%")
+                           f"提交上限 {m['pagefile_pct']:.0f}%")
         self.draw_chrome()
         return m
 
@@ -1399,10 +1426,14 @@ class MemTidyApp(GlassWindow):
         self.log(msg, "ok" if gain > 0 else "warn")
 
         # ---- 智能提示：整理之外，用户还能做什么 ----
-        # 找出当前仍是"可结束"档（tier==0）且工作集 > 150 MB 的前 3 名。
+        # 只推荐"真应用"：tier==0 且工作集 > 150 MB。
+        # 必须排除厂商常驻服务（is_service_like）—— 它们同样是 tier==0，
+        # 但结束之后会被 SCM 拉起，用户照着提示点完发现内存没降，只会
+        # 认为工具失效。服务单独统计，用来给一句"该去服务管理里禁用"的建议。
         # query_process / kill_tier 都是纯 ctypes + 全局表，线程里调用安全。
         try:
             big = []
+            svc_big = []
             for pid in enum_pids():
                 if not pid:
                     continue
@@ -1413,13 +1444,24 @@ class MemTidyApp(GlassWindow):
                 if kill_tier(name, pid) != 0:
                     continue
                 mb = ws / 1048576.0
-                if mb > 150:
+                if mb <= 150:
+                    continue
+                if is_service_like(name):
+                    svc_big.append((mb, name))
+                else:
                     big.append((mb, name))
             if big:
                 big.sort(reverse=True)
                 names = "、".join(f"{n}（占用 {m:.0f} MB）" for m, n in big[:3])
                 self.log(f"提示：结束 {names} 等进程可释放更多内存，"
                          "请在列表中选中后点「结束选中进程」。", "dim")
+            elif svc_big:
+                # 全是服务：别让用户白点，直接说清该怎么办
+                svc_big.sort(reverse=True)
+                names = "、".join(f"{n}（{m:.0f} MB）" for m, n in svc_big[:3])
+                self.log(f"提示：占用最大的是厂商后台服务 {names}，"
+                         "结束会被系统自动拉起；要彻底释放请在"
+                         "「服务」里把它设为手动或禁用。", "dim")
         except Exception:
             pass  # 提示是锦上添花，任何异常都不能影响按钮恢复
 
@@ -1442,7 +1484,7 @@ class MemTidyApp(GlassWindow):
                 self.txt_detail = (f"使用率 {m['percent']:>5.1f}%    "
                                    f"系统缓存 {m['cache_mb']/1024:.2f} GB    "
                                    f"已提交 {m['commit_mb']/1024:.2f} GB    "
-                                   f"页面文件 {m['pagefile_pct']:.0f}%")
+                                   f"提交上限 {m['pagefile_pct']:.0f}%")
                 self.draw_chrome()
             except Exception:
                 pass
@@ -1589,17 +1631,19 @@ class MemTidyApp(GlassWindow):
     SETTINGS_W = 460
     SETTINGS_H = 260
 
-    def rebuild_background(self):
+    def rebuild_background(self, reuse_prep=None):
         """重建主窗口背景。设置弹窗打开时先把它藏起来。
 
         抓屏抓的是屏幕像素，弹窗浮在主窗口上方就会被一起拍进底图
         （PITFALLS 第 8 条）。WDA_EXCLUDEFROMCAPTURE 在 Win10 2004 以下
         不生效，所以这里在应用层也兜一道 —— 任何路径触发的重建
         （拖动窗口、从最小化恢复、改透明度）都会走这个入口。
+
+        `reuse_prep` 原样透传给基类：改透明度时底图没变，没必要重抓重模糊。
         """
         win = self._settings_win
         if win is None or self._settings_hidden:
-            return super().rebuild_background()
+            return super().rebuild_background(reuse_prep=reuse_prep)
         self._settings_hidden = True
         hidden = False
         try:
@@ -1609,7 +1653,7 @@ class MemTidyApp(GlassWindow):
         except Exception:
             hidden = False
         try:
-            return super().rebuild_background()
+            return super().rebuild_background(reuse_prep=reuse_prep)
         finally:
             if hidden:
                 self._restore_settings_window()
@@ -1875,7 +1919,8 @@ class MemTidyApp(GlassWindow):
         """
         self._bg_debounce = None
         try:
-            self.rebuild_background()
+            # 改透明度不需要重抓屏重模糊，走轻量重算（约 65ms vs 150ms）
+            self.recompose()
             self._refresh_buttons_style()
             self._paint_settings_plate()
         except Exception:
@@ -2153,6 +2198,35 @@ def selftest():
           f"标题栏图标 4 个 / 表格行 {len(app.table.rows)} / "
           f"日志行 {len(app.logview.lines)}")
         p(f"玻璃系数: VEIL={app.engine.VEIL:.4f} glass_k={app.engine.glass_k:.3f}")
+        # 视差链路自检：预处理大图 + 位移裁剪 + 帧合成。任何一环坏掉，表现都是
+        # "拖动时玻璃内容跟着窗口一起跑"，肉眼很难判，必须让自检盯住。
+        eng = app.engine
+        if eng._prep is None:
+            p("拖动视差: 未启用（没有预处理大图）")
+        else:
+            _pad = eng.prep_pad
+            _base = eng.shift_for(eng.prep_origin[0] + _pad[0],
+                                  eng.prep_origin[1] + _pad[1])
+            _f0 = eng.frame(0, 0)
+            _f1 = eng.frame(60, 0)
+            _diff = -1
+            try:
+                from glass_ui.compat import ImageChops
+                _d = ImageChops.difference(_f0.convert("RGB"),
+                                           _f1.convert("RGB"))
+                _diff = max(s.getextrema()[1] for s in _d.split())
+            except Exception:
+                pass
+            _t = time.perf_counter()
+            for _ in range(3):
+                eng.frame(0, 0)
+            _ms = (time.perf_counter() - _t) * 1000 / 3
+            _ok = (_base == (0, 0) and _diff > 0
+                   and eng.can_shift(99999, 0) is False)
+            p(f"拖动视差: 余量 {_pad} / 基准位移 {_base} / "
+              f"移位 60px 差异 {_diff} / 越界已夹取 "
+              f"{eng.can_shift(99999, 0) is False} / 逐帧 {_ms:.1f} ms"
+              f"{'' if _ok else '  ← 异常'}")
         p(f"弹窗方法: glass_plate={'有' if callable(getattr(app, 'glass_plate', None)) else '缺失'} "
           f"show_about={'有' if callable(getattr(app, 'show_about', None)) else '缺失'} "
           f"info={'有' if callable(getattr(app, 'info', None)) else '缺失'} "

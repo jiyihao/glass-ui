@@ -39,6 +39,62 @@ def _mix(a, b, t):
             int(a[2] + (b[2] - a[2]) * t))
 
 
+def _fast_background(self, pil_img):
+    """拖动帧专用：只换底图贴图，不重建其它贴图、不重绘任何图元。
+
+    为什么不能直接用 `set_background()`：它会顺带重建行高亮/图标贴图并把
+    整块画布 `delete("all")` 重画一遍。拖动时每帧都走那条路，单是表格就要
+    几十毫秒，主循环直接被拖死。这里只 `itemconfigure` 那一个 image 图元。
+
+    Returns:
+        bool: False 表示没有现成的 bg 图元（首次绘制前），调用方应回退到
+        `set_background()`。
+    """
+    if pil_img is None:
+        return False
+    try:
+        photo = ImageTk.PhotoImage(pil_img)
+    except Exception:
+        return False
+    # 图元 id 缓存：`find_withtag` 每次要遍历标签表，9 个切片一帧就是
+    # 9 次；缓存后只在重绘（delete("all") 会带走旧 id）时才重新查一次。
+    # 必须验一下 id 上还挂着 "bg" 标签 —— 光靠 try/except 不够：Tk 图元
+    # id 被回收复用时不报错，会静默改到别的图元（比如某一行的高亮条）上。
+    it = getattr(self, "_bg_item", None)
+    if it is not None:
+        try:
+            alive = "bg" in self.cv.gettags(it)
+        except Exception:
+            alive = False
+        if alive:
+            try:
+                self.cv.itemconfigure(it, image=photo)
+                _hold_bg_ref(self, photo)
+                return True
+            except Exception:
+                pass
+        self._bg_item = None
+    try:
+        ids = self.cv.find_withtag("bg")
+        if not ids:
+            return False
+        it = ids[0]
+        self.cv.itemconfigure(it, image=photo)
+        self._bg_item = it
+    except Exception:
+        return False
+    _hold_bg_ref(self, photo)
+    return True
+
+
+def _hold_bg_ref(widget, photo):
+    """PhotoImage 必须挂住引用，否则被 GC 后底图变空白。"""
+    if hasattr(widget, "_bg_photo"):
+        widget._bg_photo = photo
+    if hasattr(widget, "_bg"):
+        widget._bg = photo
+
+
 class GlassButton:
     """胶囊按钮：三态贴图（常态 / 悬停 / 按下）+ Canvas 文字。
 
@@ -130,7 +186,7 @@ class GlassButton:
         cv = self.cv
         cv.delete("all")
         if self._bg is not None:
-            cv.create_image(0, 0, image=self._bg, anchor="nw")
+            cv.create_image(0, 0, image=self._bg, anchor="nw", tags=("bg",))
         if self.enabled and self.state in self._tkimg:
             cv.create_image(0, 0, image=self._tkimg[self.state], anchor="nw")
         elif not self._tkimg:
@@ -197,7 +253,7 @@ class IconButton:
         cv.delete("all")
         s = self.size
         if self._bg is not None:
-            cv.create_image(0, 0, image=self._bg, anchor="nw")
+            cv.create_image(0, 0, image=self._bg, anchor="nw", tags=("bg",))
         if self.hover:
             # 白色圆底配深色字是 Windows 的通用约定，关闭键用红色
             if self.danger:
@@ -324,7 +380,7 @@ class GlassToggle:
         cv = self.cv
         cv.delete("all")
         if self._bg is not None:
-            cv.create_image(0, 0, image=self._bg, anchor="nw")
+            cv.create_image(0, 0, image=self._bg, anchor="nw", tags=("bg",))
         on = bool(self.var.get())
         if on in self._imgs:
             cv.create_image(0, 0, image=self._imgs[on], anchor="nw")
@@ -564,7 +620,7 @@ class GlassSlider:
         cv = self.cv
         cv.delete("all")
         if self._bg is not None:
-            cv.create_image(0, 0, image=self._bg, anchor="nw")
+            cv.create_image(0, 0, image=self._bg, anchor="nw", tags=("bg",))
 
         # 拖动时每帧都会走这里：按 1/400 量化缓存，避免重复做高斯模糊
         key = (int(round(self.value * 400)), self.cw, self.ch)
@@ -911,7 +967,8 @@ class GlassTable:
         cv.delete("all")
         w, h = self.w, self.h
         if self._bg_photo is not None:
-            cv.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            cv.create_image(0, 0, image=self._bg_photo, anchor="nw",
+                            tags=("bg",))
         else:
             cv.create_rectangle(0, 0, w, h, fill=C_PANEL, outline="")
 
@@ -1028,7 +1085,8 @@ class GlassLog:
         cv.delete("all")
         w, h = self.w, self.h
         if self._bg_photo is not None:
-            cv.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            cv.create_image(0, 0, image=self._bg_photo, anchor="nw",
+                            tags=("bg",))
         else:
             cv.create_rectangle(0, 0, w, h, fill=C_PANEL, outline="")
 
@@ -1061,3 +1119,11 @@ class VarText:
             self._redraw()
 
     config = configure
+
+
+# 六个控件都需要同一条"拖动帧只换底图"的快路，逐个抄一遍容易漏。
+# 谁少写一个，拖动到那个控件上方时画面就会停住 —— 静默的视觉 bug。
+for _cls in (GlassButton, IconButton, GlassToggle, GlassSlider,
+             GlassTable, GlassLog):
+    _cls.fast_background = _fast_background
+del _cls

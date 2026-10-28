@@ -27,6 +27,27 @@ Canvas 上就只剩下文字和交互图元，重绘开销极低。
 亚克力板而不是玻璃）。`glass_k`（卡片/描边/按钮 alpha）是另一个方向
 的缩放，互不影响。
 
+## 两级缓存：把 121ms 的帧压到 18ms
+
+`compose()` 原本每次调用都从零重建所有图层，实测 980×800 下要 121ms：
+
+    GaussianBlur(18) 18ms  _glow 27ms  _noise 26ms  _card_shadow 22ms
+    _sheen 6ms  _glass 4ms  card_glow 2ms  _rim 2ms   其余 ~15ms
+
+但其中 87ms 花在**与底图无关**的静态图层上（光斑、噪点、卡片阴影、
+玻璃面、窗口棱边都只跟窗口尺寸和 glass_k 有关）。于是拆成两级：
+
+1. `prepare()` —— 抓一张带余量的大图（窗口四周各留 `PAD` 像素），
+   一次做完模糊/提饱和/降亮/叠面纱，存为 `_prep`。窗口拖动时只是从
+   这张大图里**换一个位置裁剪**，玻璃后面的桌面就跟着反向平移（视差）。
+2. `build_layers()` —— 静态装饰层建一次，其中噪点+卡片阴影+玻璃面+
+   卡片柔光按 alpha 结合律**预合并成一张 RGBA**，逐帧只合成一次。
+
+逐帧降到 13~18ms（`frame()`），拖动才谈得上跟手。
+
+合并 alpha 层会引入 ≤2/255 的舍入差（多次 8 位合成合并成一次），肉眼
+不可辨；换来的是每帧省掉 3 次全尺寸 alpha 合成。
+
 ## 关于 alpha 的坑
 
 `ImageDraw` 在 RGBA 图上**不混合 alpha，只是直接写像素**。
@@ -43,18 +64,22 @@ from .theme import R_CARD, R_WIN
 class GlassEngine:
     """抓屏 + 合成。一个窗口一个实例，重复 compose 不会重复抓屏。"""
 
-    BLUR = 30            # 高斯模糊半径。太小像磨砂贴膜，太大看不出桌面
-    VEIL = 0.74          # 深色面纱强度。越低越透、文字越难读
-    VEIL_DEFAULT = 0.74  # 出厂值，`glass_k` 用它做归一化；改它等于改整条基线
-    VEIL_MIN = 0.18      # 透明度 100% 时的面纱强度。历史上是 0.42，但光斑、
-                         # 饱和度不随之缩放，导致最透明端反而像一块浓郁的
-                         # 蓝紫青渐变"调色板"——0.18 配合 glow_k() 才是真正
-                         # 能看清桌面内容的通透玻璃
-    VEIL_MAX = 0.96      # 透明度 0% 时的面纱强度
+    BLUR = 18            # 高斯模糊半径。30 是历史值，但实测它单独就吃掉
+                         # 约一半的桌面结构（见 docs/PITFALLS.md 第 23 条），
+                         # 面纱再一压就只剩色块。18 仍保留磨砂质感，纹理可辨
+    VEIL = 0.40          # 深色面纱强度。越低越透、文字越难读
+    VEIL_DEFAULT = 0.40  # 出厂值，`glass_k` 用它做归一化；改它等于改整条基线
+    VEIL_MIN = 0.12      # 透明度 100% 时的面纱强度。历史上是 0.42、后来 0.18，
+                         # 但光斑、饱和度不随之缩放，导致最透明端反而像一块
+                         # 浓郁的蓝紫青渐变"调色板"——配合 glow_k() 才通透
+    VEIL_MAX = 0.92      # 透明度 0% 时的面纱强度
     OPACITY_DEFAULT = 74 # 用户侧的默认透明度（百分比），与 VEIL_DEFAULT 对应
     CARD_R = R_CARD
     WIN_R = R_WIN
     TITLE_H = 58         # 顶部标题栏高度，0 表示不要标题栏底色
+    PAD = 220            # 视差余量：预处理大图比窗口每边多抓这么多像素。
+                         # 越大能拖得越远不重抓，但模糊的图更大更慢
+                         # （980x800 下 220 → 1420x1240，prepare 约 100ms）
 
     def __init__(self):
         self.src = None
@@ -67,6 +92,16 @@ class GlassEngine:
         self.WIN_R = type(self).WIN_R
         self.TITLE_H = type(self).TITLE_H
 
+        # ---- 两级缓存（见模块头）----
+        self._raw = None         # 预处理大图：模糊+提饱和+降亮，未叠面纱
+        self._prep = None        # _raw 再叠面纱，逐帧从这里裁
+        self._prep_wh = (0, 0)   # 预处理中心区域（= 窗口）的尺寸
+        self._prep_pad = (0, 0, 0, 0)   # 实际可用余量 left/top/right/bottom
+        self._prep_origin = (0, 0)      # 预处理大图左上角的屏幕坐标
+        self._layers = None      # 静态装饰层缓存
+        self._layers_key = None
+        self._veil_dirty = False  # 面纱待重算（见 reveil）
+
     # --------------------------------------------------- 透明度 / 玻璃强度
     @classmethod
     def opacity_to_veil(cls, opacity):
@@ -78,9 +113,11 @@ class GlassEngine:
         ========  ==========  ==============================
         透明度     面纱系数     说明
         ========  ==========  ==============================
-        0         0.96        磨砂感最强
-        74        0.74        出厂值，与本库硬编码的历史值一致
-        100       0.18        最通透，能看清后方桌面
+        0         0.92        磨砂感最强
+        74        0.40        出厂值。旧版这里是 0.74，配合 BLUR=30 实测桌面
+                             只透出 5%，观感就是一块"自带底色的色板"，被用户
+                             判定为"玻璃感没了"。0.40 + BLUR=18 透出约 15%
+        100       0.12        最通透，桌面内容清楚可辨
         ========  ==========  ==============================
         """
         try:
@@ -114,7 +151,42 @@ class GlassEngine:
     def set_opacity(self, opacity):
         """按用户语义设置透明度，返回实际生效的百分比（已夹到 0~100）。"""
         self.VEIL = self.opacity_to_veil(opacity)
+        # 面纱 -> 底图要重 blend；glass_k -> 静态层（卡片 alpha）要重建。
+        # 模糊/提饱和那一步不依赖 VEIL，`_raw` 保留，省掉 40ms 的模糊。
+        self.reveil()
+        self.drop_layers()
         return int(round(self.veil_to_opacity(self.VEIL)))
+
+    def reveil(self):
+        """标记面纱需要重算（改透明度走这里）。
+
+        不做立即计算：滑块拖动时每秒会来几十个事件，每次都重 blend 一张
+        1420×1240 的大图要 14ms，滑块会拖出涩感。标记脏，等到真要出图
+        时再算一次。
+        """
+        if self._raw is not None:
+            self._veil_dirty = True
+
+    def _ensure_prep(self):
+        """面纱脏了就重算一次（惰性）。"""
+        if self._raw is not None and self._veil_dirty:
+            self._prep = self._apply_veil(self._raw)
+            self._veil_dirty = False
+
+    def drop_layers(self):
+        """丢弃静态装饰层缓存，下次合成时重建。"""
+        self._layers = None
+        self._layers_key = None
+
+    def invalidate(self):
+        """全部作废：换窗口尺寸、重新抓屏、换卡片布局时调用。"""
+        self._raw = None
+        self._prep = None
+        self._prep_wh = (0, 0)
+        self._prep_pad = (0, 0, 0, 0)
+        self._prep_origin = (0, 0)
+        self._veil_dirty = False
+        self.drop_layers()
 
     @property
     def glass_k(self):
@@ -164,53 +236,233 @@ class GlassEngine:
             if img.size != (w, h):
                 img = img.resize((w, h), Image.BILINEAR)
             self.src = img
+            self.invalidate()
             return img
         except Exception:
             return None
 
+    # ------------------------------------------------- 预处理（带视差余量）
+    @property
+    def prep_origin(self):
+        """预处理大图左上角的屏幕坐标。拖动时用它换算裁剪偏移。"""
+        return self._prep_origin
+
+    @property
+    def prep_pad(self):
+        """实际可用余量 (left, top, right, bottom)。贴屏幕边时会小于 PAD。"""
+        return self._prep_pad
+
+    def can_shift(self, dx, dy):
+        """这个位移还在余量范围内吗？出了范围 `frame()` 会夹住（画面停住）。"""
+        l, t, r, b = self._prep_pad
+        return -l <= dx <= r and -t <= dy <= b
+
+    def shift_for(self, x, y):
+        """窗口左上角在屏幕 (x, y) 时，相对「预处理基准位置」的位移。
+
+        基准位置 = 抓那张大图时窗口所在的位置，此时返回 (0, 0)。
+        把这段算术收在引擎里，调用方不用关心余量是怎么存的。
+        """
+        ox, oy = self._prep_origin
+        return x - ox - self._prep_pad[0], y - oy - self._prep_pad[1]
+
+    @staticmethod
+    def _pad_to(img, ox, oy, pw, ph):
+        """把抓到的核心图贴到固定尺寸画布上，四周用边缘像素拉伸补齐。
+
+        为什么不用 `paste` 留黑边：贴到屏幕边缘时余量不足，黑边会在玻璃
+        里露成一条深色带；边缘拉伸看起来像桌面继续延伸，肉眼基本看不出来。
+        """
+        cw, ch = img.size
+        mid = Image.new("RGB", (pw, ch), (0, 0, 0))
+        mid.paste(img, (ox, 0))
+        if ox > 0:
+            mid.paste(img.crop((0, 0, 1, ch)).resize((ox, ch), Image.NEAREST),
+                      (0, 0))
+        rx = ox + cw
+        if rx < pw:
+            mid.paste(img.crop((cw - 1, 0, cw, ch)).resize((pw - rx, ch),
+                                                           Image.NEAREST),
+                      (rx, 0))
+        full = Image.new("RGB", (pw, ph), (0, 0, 0))
+        full.paste(mid, (0, oy))
+        if oy > 0:
+            full.paste(mid.crop((0, 0, pw, 1)).resize((pw, oy), Image.NEAREST),
+                       (0, 0))
+        by = oy + ch
+        if by < ph:
+            full.paste(mid.crop((0, ch - 1, pw, ch)).resize((pw, ph - by),
+                                                            Image.NEAREST),
+                       (0, by))
+        return full
+
+    def prepare(self, x, y, w, h, margin=None, bounds=None):
+        """抓一张比窗口大 `margin` 的桌面图并预处理，供拖动时逐帧裁剪。
+
+        Args:
+            x, y: 窗口左上角屏幕坐标。
+            w, h: 窗口尺寸。
+            margin: 四周余量，默认 `PAD`。
+            bounds: 虚拟桌面 (x, y, w, h)。给了就用来夹抓屏范围，避免
+                抓出屏幕后拿到黑块。不给则按 `PAD` 原样抓。
+
+        Returns:
+            bool: 成功与否。失败时 `self._prep` 为 None，`compose()` 会
+            退回到不带余量的旧路径。
+        """
+        if not HAVE_PIL or w <= 0 or h <= 0:
+            return False
+        m = int(self.PAD if margin is None else margin)
+        x0, y0 = x - m, y - m
+        x1, y1 = x + w + m, y + h + m
+        if bounds:
+            vx, vy, vw, vh = bounds
+            x0 = max(vx, x0)
+            y0 = max(vy, y0)
+            x1 = min(vx + vw, x1)
+            y1 = min(vy + vh, y1)
+        if x1 <= x0 or y1 <= y0:
+            return False
+        try:
+            core = ImageGrab.grab(bbox=(x0, y0, x1, y1), all_screens=True)
+            core = core.convert("RGB")
+        except Exception:
+            return False
+        if core.size != (x1 - x0, y1 - y0):
+            try:
+                core = core.resize((x1 - x0, y1 - y0), Image.BILINEAR)
+            except Exception:
+                return False
+
+        pw, ph = w + 2 * m, h + 2 * m
+        ox, oy = x0 - (x - m), y0 - (y - m)
+        full = self._pad_to(core, ox, oy, pw, ph)
+
+        self._raw = self._finish_base(full)
+        self._prep = self._apply_veil(self._raw)
+        self._veil_dirty = False
+        self._prep_wh = (w, h)
+        self._prep_pad = (x - x0, y - y0, x1 - (x + w), y1 - (y + h))
+        self._prep_origin = (x0, y0)
+        self._layers = None
+        self._layers_key = None
+        return True
+
+    def _finish_base(self, img):
+        """底图的像素级处理：模糊 → 提饱和 → 降亮。不依赖窗口位置。"""
+        img = img.filter(ImageFilter.GaussianBlur(self.BLUR))
+        # 提饱和的幅度跟着 glow_k 走：74% 时恰为 1.0 + 1.05 = 2.05，与
+        # 旧版逐像素一致；越通透加得越少，否则薄面纱 + 高饱和 = 油彩感
+        img = ImageEnhance.Color(img).enhance(1.0 + 1.05 * self.glow_k())
+        return ImageEnhance.Brightness(img).enhance(0.96)
+
+    def _apply_veil(self, img):
+        veil = Image.new("RGB", img.size, (13, 15, 23))
+        return Image.blend(img, veil, max(0.0, min(1.0, float(self.VEIL))))
+
+    # ------------------------------------------------------- 静态图层缓存
+    def build_layers(self, w, h, cards=(), decorators=()):
+        """把只跟窗口尺寸/glass_k 有关的图层建好缓存起来（一次约 57ms）。
+
+        噪点 + 卡片阴影 + 玻璃面 + 卡片柔光这四层都是 alpha 叠加，且顺序
+        相邻，按结合律预合并成一张 RGBA，逐帧只合成一次（省 3 次全尺寸
+        合成，代价是 ≤2/255 的舍入差）。光斑是 screen、顶部镜面是 add，
+        不能并进 alpha 层，各自保留为独立图层。
+        """
+        blank = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        black = Image.new("RGB", (w, h), (0, 0, 0))
+
+        # screen(黑, 图层) 就等于图层本身 —— 借这个性质把图层单独取出来
+        glow_layer = self._glow(black, self.glow_k())
+        sheen_layer = self._sheen(black)
+        rim_layer = self._rim(blank)
+
+        n = Image.effect_noise((w, h), 9).convert("L")
+        a = Image.new("L", (w, h), 11)
+        overlay = Image.merge("RGBA", (n, n, n, a))
+        overlay = Image.alpha_composite(overlay, self._card_shadow(blank, cards))
+        overlay = Image.alpha_composite(overlay, self._glass(blank, cards))
+        for (x, y, cw, ch) in cards:
+            overlay.alpha_composite(self.card_glow(cw, ch), (x, y))
+
+        self._layers = {
+            "glow": glow_layer, "sheen": sheen_layer,
+            "overlay": overlay, "rim": rim_layer,
+            "decorators": tuple(decorators),
+        }
+        self._layers_key = (w, h, round(self.glass_k, 4), tuple(cards),
+                            tuple(decorators))
+        return self._layers
+
+    def _ensure_layers(self, w, h, cards, decorators):
+        key = (w, h, round(self.glass_k, 4), tuple(cards), tuple(decorators))
+        if self._layers is None or self._layers_key != key:
+            self.build_layers(w, h, cards, decorators)
+        return self._layers
+
     # ------------------------------------------------------------------ 合成
-    def compose(self, w, h, cards=(), buttons=(), decorators=()):
-        """生成最终底图。
+    def frame(self, dx=0, dy=0, buttons=()):
+        """从预处理大图里裁一帧并贴回静态图层（约 13~18ms）。
+
+        Args:
+            dx, dy: 窗口相对「预处理时位置」的位移。玻璃后的桌面会跟着
+                反向平移，这就是拖动视差。超出余量会被夹住。
+            buttons: 需要在最终图上画底面的按钮，一般留空。
+        """
+        self._ensure_prep()
+        if self._prep is None or self._layers is None:
+            return None
+        w, h = self._prep_wh
+        l, t = self._prep_pad[0], self._prep_pad[1]
+        px = max(0, min(self._prep.size[0] - w, l + int(dx)))
+        py = max(0, min(self._prep.size[1] - h, t + int(dy)))
+        img = self._prep.crop((px, py, px + w, py + h))
+
+        L = self._layers
+        img = ImageChops.screen(img, L["glow"])
+        img = ImageChops.add(img, L["sheen"])
+        img = Image.alpha_composite(img.convert("RGBA"), L["overlay"])
+        for fn in L["decorators"]:
+            img = fn(img)
+        img = Image.alpha_composite(img, L["rim"])
+        for (bx, by, bw, bh, kind) in buttons:
+            img = self._paint_button(img, bx, by, bw, bh, kind, "normal")
+        return img
+
+    def compose(self, w, h, cards=(), buttons=(), decorators=(), offset=None):
+        """生成最终底图（接口不变）。有预处理大图就直接裁一帧，否则现场做。
 
         cards      : [(x, y, w, h)] 卡片矩形，会被画成半透明玻璃块
         buttons    : [(x, y, w, h, kind)] 按钮底面，一般留空（按钮有自己的画布）
         decorators : [fn(img) -> img]，卡片画完之后、窗口棱边之前调用的自定义层
+        offset     : (dx, dy) 窗口相对预处理基准位置的位移。复用旧预处理图
+                     重绘时（比如拖动后改透明度）必须传，否则玻璃内容会弹回
+                     拖动前的位置。
         """
         if not HAVE_PIL:
             return None
 
-        base = None
-        if self.src is not None:
-            try:
-                base = self.src.resize((w, h), Image.BILINEAR)
-            except Exception:
-                base = None
-        if base is None:
-            base = self._synthetic(w, h)
+        if self._prep is None or self._prep_wh != (w, h):
+            # 没走 prepare()（老调用点）或尺寸变了：现场从 self.src 做一张
+            # 不带余量的，行为与改造前一致
+            base = None
+            if self.src is not None:
+                try:
+                    base = self.src.resize((w, h), Image.BILINEAR)
+                except Exception:
+                    base = None
+            if base is None:
+                base = self._synthetic(w, h)
+            self._raw = self._finish_base(base)
+            self._prep = self._apply_veil(self._raw)
+            self._veil_dirty = False
+            self._prep_wh = (w, h)
+            self._prep_pad = (0, 0, 0, 0)
+            self._prep_origin = (0, 0)
 
-        img = base.filter(ImageFilter.GaussianBlur(self.BLUR))
-        # 提饱和的幅度跟着 glow_k 走：74% 时恰为 1.0 + 1.05 = 2.05，与
-        # 旧版逐像素一致；越通透加得越少，否则薄面纱 + 高饱和 = 油彩感
-        img = ImageEnhance.Color(img).enhance(1.0 + 1.05 * self.glow_k())
-        img = ImageEnhance.Brightness(img).enhance(0.96)
-
-        veil = Image.new("RGB", (w, h), (13, 15, 23))
-        img = Image.blend(img, veil, max(0.0, min(1.0, float(self.VEIL))))
-        img = self._glow(img, self.glow_k())
-        img = self._sheen(img)
-        img = self._noise(img)
-
-        img = img.convert("RGBA")
-        img = self._card_shadow(img, cards)
-        img = self._glass(img, cards)
-        for (x, y, cw, ch) in cards:
-            img.alpha_composite(self.card_glow(cw, ch), (x, y))
-        for fn in decorators:
-            img = fn(img)
-        img = self._rim(img)
-        for (x, y, cw, ch, kind) in buttons:
-            img = self._paint_button(img, x, y, cw, ch, kind, "normal")
-        return img
+        self._ensure_layers(w, h, cards, decorators)
+        dx, dy = offset if offset else (0, 0)
+        return self.frame(dx, dy, buttons)
 
     # ------------------------------------------------------------ 兜底底图
     @staticmethod

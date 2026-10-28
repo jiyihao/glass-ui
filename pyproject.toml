@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "glass-ui"
-version = "0.1.6"
+version = "0.1.7"
 description = "Liquid-glass UI layer for tkinter on Windows: real desktop blur behind your window, plus fully self-drawn widgets (the engine behind MemTidy, a Windows memory optimizer)."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -42,7 +42,7 @@ from .widgets import (GlassButton, GlassLog, GlassSlider, GlassTable,
                       GlassToggle, IconButton, VarText)
 from .window import GlassWindow
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 __all__ = [
     "GlassEngine", "GlassWindow",

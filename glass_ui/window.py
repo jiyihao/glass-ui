@@ -19,6 +19,7 @@
 4. 实现 `glass_slices()`，告诉基类哪些控件需要背景切片
 """
 
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 
@@ -27,7 +28,8 @@ from .engine import GlassEngine
 from .theme import C_BG, FONT_UI, R_CARD, R_WIN
 from .widgets import GlassButton
 from .win import (WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, apply_round_region,
-                  get_exstyle, make_taskbar_window, set_capture_affinity)
+                  get_exstyle, make_taskbar_window, set_capture_affinity,
+                  virtual_screen_rect)
 
 
 class GlassWindow:
@@ -66,6 +68,13 @@ class GlassWindow:
         self._drag = None
         self._win_x = 0          # geometry 请求位置；窗口未映射时抓屏用
         self._win_y = 0
+        # 拖动视差：_drag_target 是待绘制的最新位置，_drag_pending 保证同一
+        # 时刻只有一个 after 在排队（鼠标上报 125Hz，一帧要 18ms，不合并会积压）
+        self._drag_target = None
+        self._drag_pending = False
+        self._drag_frames = 0
+        self._drag_t0 = 0.0
+        self._drag_need_prep = False
 
         self.fit_screen()
         self.setup_window()
@@ -220,21 +229,124 @@ class GlassWindow:
         self.root.mainloop()
 
     # ---------------------------------------------------------------- 拖动
+    #
+    # 玻璃的底图是一张静止的桌面快照。窗口移动时如果底图跟着一起走，看起来
+    # 就像把桌面截图贴在了卡片上 —— 物理感是错的。正确做法是：抓一张比窗口
+    # 大两圈余量的大图，拖动时按位移**从里面换位置裁剪**，玻璃后的桌面就
+    # 相对于窗口反向平移，这才是隔着玻璃看桌面的样子。
+    #
+    # 代价是每帧都要合成。所以引擎里做了两级缓存（见 engine 模块头），
+    # 逐帧只要 13~18ms；事件还必须合并，否则 125Hz 的鼠标上报会积压成雪崩。
     def drag_start(self, e):
         self._drag = (e.x_root, e.y_root,
                       self.root.winfo_x(), self.root.winfo_y())
+        self._drag_target = None
+        self._drag_pending = False
+        self._drag_frames = 0
+        self._drag_t0 = time.perf_counter()
+        self._slice_tick = 0
 
     def drag_move(self, e):
         if not self._drag:
             return
-        self.root.geometry(
-            f"+{self._drag[2] + e.x_root - self._drag[0]}+"
-            f"{self._drag[3] + e.y_root - self._drag[1]}")
+        x = self._drag[2] + e.x_root - self._drag[0]
+        y = self._drag[3] + e.y_root - self._drag[1]
+        try:
+            self.root.geometry(f"+{x}+{y}")
+        except Exception:
+            return
+        self._drag_target = (x, y)
+        self._queue_drag_frame()
+
+    def _queue_drag_frame(self):
+        """合并连续的移动事件，一帧只合成一次。"""
+        if self._drag_pending:
+            return
+        self._drag_pending = True
+        self.root.after(1, self._paint_drag_frame)
+
+    def _paint_drag_frame(self):
+        self._drag_pending = False
+        if self._drag_target is None or not self.engine.ok:
+            return
+        x, y = self._drag_target
+        dx, dy = self.engine.shift_for(x, y)
+        if not self.engine.can_shift(dx, dy):
+            # 跑出余量：这一帧会被夹住（画面停住），松手后再重新抓
+            self._drag_need_prep = True
+        img = self.engine.frame(dx, dy)
+        if img is None:
+            return
+        if self._apply_frame_image(img):
+            self._drag_frames += 1
+
+    def _apply_frame_image(self, img):
+        """只换底图贴图，不重绘任何图元 —— 拖动帧的快路。
+
+        走 `rebuild_background()` 会连 draw_chrome() 一起重画（几百个图元），
+        那是 100ms 级的开销，拖动时每帧来一次必然卡死。
+        """
+        try:
+            rgb = img if img.mode == "RGB" else img.convert("RGB")
+            photo = ImageTk.PhotoImage(rgb)
+        except Exception:
+            return False
+        ids = self.cv.find_withtag("bg")
+        if not ids:
+            return False
+        self.bg_photo = photo
+        self._bg_img = rgb
+        try:
+            self.cv.itemconfigure(ids[0], image=photo)
+        except Exception:
+            return False
+        # 切片隔帧刷新：它占掉一帧的三分之一，而滞后一帧肉眼完全看不出
+        self._slice_tick = getattr(self, "_slice_tick", 0) + 1
+        if self._slice_tick % 2 == 1:
+            self._refresh_slices_fast(rgb)
+        return True
+
+    def _refresh_slices_fast(self, img):
+        """从已转成 RGB 的整幅底图上切片，只换贴图不重绘。"""
+        iw, ih = img.size
+        try:
+            for widget, x, y, w, h in self.glass_slices():
+                x = max(0, int(x))
+                y = max(0, int(y))
+                w = max(1, min(iw - x, int(w)))
+                h = max(1, min(ih - y, int(h)))
+                piece = img.crop((x, y, x + w, y + h))
+                if not widget.fast_background(piece):
+                    widget.set_background(piece)
+        except Exception:
+            pass
 
     def drag_end(self, _e=None):
         self._drag = None
-        # 松手后桌面已经完全露出来，此时重新抓屏才干净
-        self.schedule_bg(180)
+        self._drag_target = None
+        self._drag_pending = False
+        # 切片是隔帧刷的，最后一帧可能少刷一次，补上（否则松手后表格
+        # 底下会留一帧错位的玻璃纹理，停下来盯着看能看出来）
+        if self._drag_frames and self._bg_img is not None:
+            try:
+                self._refresh_slices_fast(self._bg_img)
+            except Exception:
+                pass
+        if self._drag_need_prep:
+            # 跑出了预处理范围，只能重新抓一张。此时窗口已经停在新位置，
+            # 抓屏会把窗口自己模糊后的影像混进来 —— 老版本每次松手都这样，
+            # 现在只在拖得很远之后才发生一次。
+            self._drag_need_prep = False
+            self.schedule_bg(60)
+        # 没跑出余量就什么都不做：玻璃内容本来就停在正确位置，重抓反而
+        # 会把窗口自己的影像烤进玻璃（旧行为），白白掉一档清晰度。
+
+    def drag_stats(self):
+        """最近一次拖动的帧统计（诊断用）。"""
+        dt = max(1e-6, time.perf_counter() - self._drag_t0)
+        n = self._drag_frames
+        return {"frames": n, "seconds": round(dt, 3),
+                "fps": round(n / dt, 1) if n else 0.0}
 
     # ------------------------------------------------------------ 背景重建
     def schedule_bg(self, delay=120):
@@ -256,7 +368,17 @@ class GlassWindow:
             pass
         return getattr(self, "_win_x", 0), getattr(self, "_win_y", 0)
 
-    def rebuild_background(self):
+    def _prep_still_valid(self, gx, gy, w, h):
+        """现有预处理大图还能直接用吗（位置和尺寸都没变）。"""
+        if not self.engine.ok or self.engine._prep is None:
+            return False
+        if self.engine._prep_wh != (w, h):
+            return False
+        ox, oy = self.engine.prep_origin
+        pad = self.engine.prep_pad
+        return (ox + pad[0], oy + pad[1]) == (int(gx), int(gy))
+
+    def rebuild_background(self, reuse_prep=None):
         self._bg_pending = False
         w, h = self.win_w, self.win_h
         try:
@@ -287,13 +409,47 @@ class GlassWindow:
 
         if self.engine.ok:
             gx, gy = self._grab_origin()
-            self.engine.grab(gx, gy, w, h)
+            if reuse_prep is None:
+                # 没显式要求时自动判断：位置尺寸没变就别重抓。重抓时窗口
+                # 已经显示在屏幕上，抓到的会混进自己模糊后的影像 —— 首屏
+                # 那张是映射前抓的、完全干净，能留就留。
+                reuse_prep = self._prep_still_valid(gx, gy, w, h)
+            # 抓一张带余量的大图：拖动时从里面换位置裁剪，玻璃后的桌面
+            # 才会相对窗口反向平移。贴屏幕边时余量会被 bounds 夹小，
+            # `can_shift()` 会自动跟着变小。
+            if not reuse_prep:
+                # 抓屏那一瞬间把自己排除在画面之外：窗口已经在屏幕上，不排除
+                # 就会抓到它自己模糊后的影像，玻璃看起来像在"照镜子"（实测
+                # 与真桌面的差异 44 vs 3.3）。DWM 立即生效，抓完立刻清掉，
+                # 所以不会出现"按住 Win+Shift+S 时窗口消失"那个老问题。
+                mapped = False
+                try:
+                    mapped = bool(self.root.winfo_ismapped())
+                except Exception:
+                    pass
+                if mapped:
+                    set_capture_affinity(self.root, True)
+                try:
+                    if not self.engine.prepare(gx, gy, w, h, self.engine.PAD,
+                                               virtual_screen_rect()):
+                        self.engine.grab(gx, gy, w, h)  # 兜底：不带余量
+                finally:
+                    if mapped:
+                        set_capture_affinity(self.root, bool(self.CAPTURE_SAFE))
+
+        # 复用旧预处理大图时（例如拖动后改透明度），窗口已经不在原来的位置，
+        # 必须把「当前位移」告诉引擎，否则玻璃内容会弹回拖动前的位置
+        off = (0, 0)
+        if self.engine._prep is not None:
+            off = self.engine.shift_for(gx, gy)
 
         img = self.engine.compose(w, h,
                                   self.glass_cards(),
                                   self.glass_buttons(),
-                                  self.glass_decorators())
+                                  self.glass_decorators(),
+                                  offset=off)
         self._bg_img = img
+        self._drag_need_prep = False
         if img is None:
             self.bg_photo = None
         else:
@@ -301,6 +457,7 @@ class GlassWindow:
             self.refresh_slices(img)
 
         self.draw_chrome()
+        self._tag_bg_item()
 
     def refresh_slices(self, img):
         """给每个子 Canvas 切出所在区域的背景块。"""
@@ -316,6 +473,37 @@ class GlassWindow:
         try:
             for widget, x, y, w, h in self.glass_slices():
                 widget.set_background(cut(x, y, w, h))
+        except Exception:
+            pass
+
+    def recompose(self):
+        """不重新抓屏，只按当前参数重算底图（改透明度走这条）。
+
+        抓屏 30ms + 大图模糊 40ms 都与面纱无关，改透明度只需要重 blend 一次
+        面纱、再重建静态层（glass_k 变了卡片 alpha 就得跟着变）。省下来的是
+        滑块松手后那一百多毫秒的停顿感。
+        """
+        if not self.engine.ok or self.engine._prep is None:
+            self.rebuild_background()
+            return
+        self.engine.reveil()
+        self.engine.drop_layers()
+        self.rebuild_background(reuse_prep=True)
+
+    def _tag_bg_item(self):
+        """给主画布的底图打上 "bg" 标记 —— 拖动帧靠它找到要替换的图元。
+
+        底图是子类在 `draw_chrome()` 里画的，基类拿不到 item id。兜底办法：
+        底图永远是最先创建的图元（后画的都压在它上面），取堆叠顺序里第一个
+        image 就是它。子类显式写 `tags=("bg",)` 更稳妥，这条只是保险。
+        """
+        try:
+            if self.cv.find_withtag("bg"):
+                return
+            for it in self.cv.find_all():
+                if self.cv.type(it) == "image":
+                    self.cv.addtag_withtag("bg", it)
+                    return
         except Exception:
             pass
 

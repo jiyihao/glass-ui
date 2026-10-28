@@ -39,12 +39,27 @@ def _mix(a, b, t):
             int(a[2] + (b[2] - a[2]) * t))
 
 
+def _photo_slot(widget):
+    """找出控件当前那张底图贴图存在哪个属性上（各类命名不统一）。"""
+    for name in ("_bg_photo", "_bg"):
+        ph = getattr(widget, name, None)
+        if isinstance(ph, ImageTk.PhotoImage):
+            return ph
+    return None
+
+
 def _fast_background(self, pil_img):
-    """拖动帧专用：只换底图贴图，不重建其它贴图、不重绘任何图元。
+    """拖动帧专用：只换底图贴图的**像素**，不重建贴图、不重绘任何图元。
 
     为什么不能直接用 `set_background()`：它会顺带重建行高亮/图标贴图并把
     整块画布 `delete("all")` 重画一遍。拖动时每帧都走那条路，单是表格就要
-    几十毫秒，主循环直接被拖死。这里只 `itemconfigure` 那一个 image 图元。
+    几十毫秒，主循环直接被拖死。
+
+    第二层节省在贴图复用：`ImageTk.PhotoImage(piece)` 每次都要在 Tcl 侧
+    新建一张 photo、再把整块像素灌过去；13 片切片一帧实测 21ms，比引擎
+    合成（15ms）还贵。尺寸没变时改成往**同一张** photo 里 `paste`，Tk 会
+    自己让所有显示它的图元重画，连 `itemconfigure` 都不用发 —— 同一帧
+    1.6ms，差一个数量级。
 
     Returns:
         bool: False 表示没有现成的 bg 图元（首次绘制前），调用方应回退到
@@ -52,37 +67,52 @@ def _fast_background(self, pil_img):
     """
     if pil_img is None:
         return False
-    try:
-        photo = ImageTk.PhotoImage(pil_img)
-    except Exception:
-        return False
-    # 图元 id 缓存：`find_withtag` 每次要遍历标签表，9 个切片一帧就是
-    # 9 次；缓存后只在重绘（delete("all") 会带走旧 id）时才重新查一次。
+    # 图元 id 缓存：`find_withtag` 每次要遍历标签表，13 片一帧就是 13 次；
+    # 缓存后只在重绘（delete("all") 会带走旧 id）时才重新查一次。
     # 必须验一下 id 上还挂着 "bg" 标签 —— 光靠 try/except 不够：Tk 图元
     # id 被回收复用时不报错，会静默改到别的图元（比如某一行的高亮条）上。
     it = getattr(self, "_bg_item", None)
     if it is not None:
         try:
-            alive = "bg" in self.cv.gettags(it)
+            if "bg" not in self.cv.gettags(it):
+                it = None
         except Exception:
-            alive = False
-        if alive:
-            try:
-                self.cv.itemconfigure(it, image=photo)
-                _hold_bg_ref(self, photo)
-                return True
-            except Exception:
-                pass
-        self._bg_item = None
-    try:
-        ids = self.cv.find_withtag("bg")
+            it = None
+        if it is None:
+            self._bg_item = None
+    if it is None:
+        try:
+            ids = self.cv.find_withtag("bg")
+        except Exception:
+            return False
         if not ids:
             return False
         it = ids[0]
-        self.cv.itemconfigure(it, image=photo)
+
+    ph = _photo_slot(self)
+    same = False
+    if ph is not None:
+        try:
+            same = (ph.width() == pil_img.width
+                    and ph.height() == pil_img.height)
+        except Exception:
+            same = False
+    if same:
+        try:
+            ph.paste(pil_img)
+        except Exception:
+            same = False
+    if same:
         self._bg_item = it
+        _hold_bg_ref(self, ph)
+        return True
+
+    try:
+        photo = ImageTk.PhotoImage(pil_img)
+        self.cv.itemconfigure(it, image=photo)
     except Exception:
         return False
+    self._bg_item = it
     _hold_bg_ref(self, photo)
     return True
 

@@ -38,6 +38,10 @@ class GlassWindow:
     MIN_H = 620
     TITLE = "Glass UI"
     CAPTURE_SAFE = False      # 见 rebuild_background()：默认不再排除抓屏
+    # 预处理大图的面积上限（像素）。余量取到"够拖遍整个桌面"时，大图的
+    # 尺寸等于屏幕尺寸，模糊/提饱和的代价随面积涨；超过这个量级就按比例
+    # 收小余量，宁可远处被夹住也别让启动卡顿几百毫秒。2560x1440 仍覆盖。
+    PREP_MAX_PX = 4_400_000
 
     # -------------------------------------------------------------- 生命周期
     def __init__(self, root, shot=False, title=None, glass_opacity=None):
@@ -281,26 +285,46 @@ class GlassWindow:
             self._drag_frames += 1
 
     def _apply_frame_image(self, img):
-        """只换底图贴图，不重绘任何图元 —— 拖动帧的快路。
+        """只换底图贴图的像素，不重绘任何图元 —— 拖动帧的快路。
 
         走 `rebuild_background()` 会连 draw_chrome() 一起重画（几百个图元），
         那是 100ms 级的开销，拖动时每帧来一次必然卡死。
+
+        贴图本身也复用：尺寸没变就往同一张 PhotoImage 里 `paste`，省掉每次
+        重建 Tk photo 的开销（实测 2.2ms → 1.0ms），并且不用再发
+        `itemconfigure` —— Tk 会自己重画所有显示这张 photo 的图元。
         """
         try:
             rgb = img if img.mode == "RGB" else img.convert("RGB")
-            photo = ImageTk.PhotoImage(rgb)
         except Exception:
             return False
         ids = self.cv.find_withtag("bg")
         if not ids:
             return False
+        photo = self.bg_photo
+        reused = False
+        if photo is not None:
+            try:
+                reused = (photo.width() == rgb.width
+                          and photo.height() == rgb.height)
+            except Exception:
+                reused = False
+        if reused:
+            try:
+                photo.paste(rgb)
+            except Exception:
+                reused = False
+        if not reused:
+            try:
+                photo = ImageTk.PhotoImage(rgb)
+                self.cv.itemconfigure(ids[0], image=photo)
+            except Exception:
+                return False
         self.bg_photo = photo
         self._bg_img = rgb
-        try:
-            self.cv.itemconfigure(ids[0], image=photo)
-        except Exception:
-            return False
-        # 切片隔帧刷新：它占掉一帧的三分之一，而滞后一帧肉眼完全看不出
+        # 切片隔帧刷新：贴图复用后单片只要几十微秒，但一帧 13 片往 Tcl 里
+        # 搬像素仍要 4ms 上下，占掉一帧的六分之一；滞后一帧（约 35ms）肉眼
+        # 看不出来，硬刷每帧只会把帧率压下去。
         self._slice_tick = getattr(self, "_slice_tick", 0) + 1
         if self._slice_tick % 2 == 1:
             self._refresh_slices_fast(rgb)
@@ -378,6 +402,38 @@ class GlassWindow:
         pad = self.engine.prep_pad
         return (ox + pad[0], oy + pad[1]) == (int(gx), int(gy))
 
+    def _prep_margin(self, gx, gy, w, h):
+        """抓屏余量：取到"能拖遍整个桌面"为止。
+
+        固定 220px 的问题：拖出 220 像素之后 `frame()` 就被夹住，窗口还在
+        动、玻璃里的桌面却钉在原地 —— 比完全没有视差更违和（用户把窗口从
+        屏幕中间拖到边上一定会撞到）。这里按窗口到四条屏幕边的距离取余量，
+        配合 `prepare()` 的 bounds 夹取，预处理图的尺寸正好等于整个桌面：
+        拖到哪都有真实桌面内容，且不再触发"松手后重抓"。
+
+        面积超过 `PREP_MAX_PX` 时按 0.7 逐次收小 —— 超大桌面（双 4K）上
+        保住启动速度比保住远处视差重要。
+        """
+        m = int(self.engine.PAD)
+        try:
+            vs = virtual_screen_rect()
+        except Exception:
+            vs = None
+        if not vs:
+            return m
+        vx, vy, vw, vh = vs
+        m = max(m, int(gx - vx), int(gy - vy),
+                int(vx + vw - (gx + w)), int(vy + vh - (gy + h)))
+        # 预处理图的实际尺寸是"窗口 + 余量"和桌面的交集，按交集算面积，
+        # 不然会把屏幕外的部分也算进去，白收小余量
+        while m > self.engine.PAD:
+            x0, x1 = max(vx, gx - m), min(vx + vw, gx + w + m)
+            y0, y1 = max(vy, gy - m), min(vy + vh, gy + h + m)
+            if (x1 - x0) * (y1 - y0) <= self.PREP_MAX_PX:
+                break
+            m = int(m * 0.7)
+        return m
+
     def rebuild_background(self, reuse_prep=None):
         self._bg_pending = False
         w, h = self.win_w, self.win_h
@@ -430,7 +486,8 @@ class GlassWindow:
                 if mapped:
                     set_capture_affinity(self.root, True)
                 try:
-                    if not self.engine.prepare(gx, gy, w, h, self.engine.PAD,
+                    if not self.engine.prepare(gx, gy, w, h,
+                                               self._prep_margin(gx, gy, w, h),
                                                virtual_screen_rect()):
                         self.engine.grab(gx, gy, w, h)  # 兜底：不带余量
                 finally:

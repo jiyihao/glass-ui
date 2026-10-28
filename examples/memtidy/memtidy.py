@@ -60,7 +60,7 @@ from glass_ui.compat import HAVE_PIL, Image, ImageDraw, ImageTk
 from glass_ui.win import apply_round_region, make_taskbar_window
 
 APP_NAME = "内存整理器"
-APP_VER = "2.5"
+APP_VER = "2.6"
 APP_TAG = "MemTidy"
 APP_TITLE = f"{APP_NAME}  {APP_VER}"
 

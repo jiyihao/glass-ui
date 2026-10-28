@@ -37,9 +37,10 @@ Canvas 上就只剩下文字和交互图元，重绘开销极低。
 但其中 87ms 花在**与底图无关**的静态图层上（光斑、噪点、卡片阴影、
 玻璃面、窗口棱边都只跟窗口尺寸和 glass_k 有关）。于是拆成两级：
 
-1. `prepare()` —— 抓一张带余量的大图（窗口四周各留 `PAD` 像素），
-   一次做完模糊/提饱和/降亮/叠面纱，存为 `_prep`。窗口拖动时只是从
-   这张大图里**换一个位置裁剪**，玻璃后面的桌面就跟着反向平移（视差）。
+1. `prepare()` —— 抓一张带余量的大图（余量取到能拖遍整个桌面，见
+   `GlassWindow._prep_margin`），一次做完模糊/提饱和/降亮/叠面纱，存为
+   `_prep`。窗口拖动时只是从这张大图里**换一个位置裁剪**，玻璃后面的桌面
+   就跟着反向平移（视差）。
 2. `build_layers()` —— 静态装饰层建一次，其中噪点+卡片阴影+玻璃面+
    卡片柔光按 alpha 结合律**预合并成一张 RGBA**，逐帧只合成一次。
 
@@ -77,9 +78,9 @@ class GlassEngine:
     CARD_R = R_CARD
     WIN_R = R_WIN
     TITLE_H = 58         # 顶部标题栏高度，0 表示不要标题栏底色
-    PAD = 220            # 视差余量：预处理大图比窗口每边多抓这么多像素。
-                         # 越大能拖得越远不重抓，但模糊的图更大更慢
-                         # （980x800 下 220 → 1420x1240，prepare 约 100ms）
+    PAD = 220            # 视差余量下限。真正的余量由 GlassWindow 按窗口到
+                         # 屏幕四边的距离算（取到能拖遍整个桌面），这里只是
+                         # 直接调 prepare() 时的默认值。
 
     def __init__(self):
         self.src = None
@@ -266,45 +267,21 @@ class GlassEngine:
         ox, oy = self._prep_origin
         return x - ox - self._prep_pad[0], y - oy - self._prep_pad[1]
 
-    @staticmethod
-    def _pad_to(img, ox, oy, pw, ph):
-        """把抓到的核心图贴到固定尺寸画布上，四周用边缘像素拉伸补齐。
-
-        为什么不用 `paste` 留黑边：贴到屏幕边缘时余量不足，黑边会在玻璃
-        里露成一条深色带；边缘拉伸看起来像桌面继续延伸，肉眼基本看不出来。
-        """
-        cw, ch = img.size
-        mid = Image.new("RGB", (pw, ch), (0, 0, 0))
-        mid.paste(img, (ox, 0))
-        if ox > 0:
-            mid.paste(img.crop((0, 0, 1, ch)).resize((ox, ch), Image.NEAREST),
-                      (0, 0))
-        rx = ox + cw
-        if rx < pw:
-            mid.paste(img.crop((cw - 1, 0, cw, ch)).resize((pw - rx, ch),
-                                                           Image.NEAREST),
-                      (rx, 0))
-        full = Image.new("RGB", (pw, ph), (0, 0, 0))
-        full.paste(mid, (0, oy))
-        if oy > 0:
-            full.paste(mid.crop((0, 0, pw, 1)).resize((pw, oy), Image.NEAREST),
-                       (0, 0))
-        by = oy + ch
-        if by < ph:
-            full.paste(mid.crop((0, ch - 1, pw, ch)).resize((pw, ph - by),
-                                                            Image.NEAREST),
-                       (0, by))
-        return full
-
     def prepare(self, x, y, w, h, margin=None, bounds=None):
         """抓一张比窗口大 `margin` 的桌面图并预处理，供拖动时逐帧裁剪。
+
+        抓到的图**就是**预处理图，不再垫成 (w+2m) 的对称画布：贴屏幕边时
+        真实可用的余量本来就不均匀（`_prep_pad` 记四边各自的量，`frame()`
+        也不要求对称），垫画布只会把屏幕外的部分一起模糊一遍 —— 2560x1440
+        的桌面上那是白烧 60% 的像素。
 
         Args:
             x, y: 窗口左上角屏幕坐标。
             w, h: 窗口尺寸。
-            margin: 四周余量，默认 `PAD`。
+            margin: 四周余量，默认 `PAD`。`GlassWindow` 会传一个更大的值
+                （窗口到屏幕四边的距离），这样拖到哪儿玻璃里都有真实桌面。
             bounds: 虚拟桌面 (x, y, w, h)。给了就用来夹抓屏范围，避免
-                抓出屏幕后拿到黑块。不给则按 `PAD` 原样抓。
+                抓出屏幕后拿到黑块。不给则按 `margin` 原样抓。
 
         Returns:
             bool: 成功与否。失败时 `self._prep` 为 None，`compose()` 会
@@ -334,9 +311,12 @@ class GlassEngine:
             except Exception:
                 return False
 
-        pw, ph = w + 2 * m, h + 2 * m
-        ox, oy = x0 - (x - m), y0 - (y - m)
-        full = self._pad_to(core, ox, oy, pw, ph)
+        # 旧写法是把抓到的区域贴进 (w+2m) 的对称画布、四周用边缘像素拉伸
+        # 补齐。m 取到"能拖遍整个桌面"之后这个画布会比屏幕还大（2560x1440
+        # 的桌面上算出来 2560x2380），白白多模糊 60% 的像素。抓到的区域
+        # 本身已经是真实桌面，直接用就行 —— `_prep_pad` 记的是四边各自的
+        # 余量，`frame()` 本来就不要求对称。
+        full = core
 
         self._raw = self._finish_base(full)
         self._prep = self._apply_veil(self._raw)
